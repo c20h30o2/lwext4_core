@@ -1,0 +1,23 @@
+[package]
+name = "lwext4_core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 基础依赖
+log = { version = "0.4", default-features = false }
+
+# 字节序处理
+byteorder = { version = "1.5", default-features = false }
+
+# 位操作
+bitflags = "2.4"
+
+# CRC32C 校验和（用于 superblock 和其他元数据）
+# 使用 crc32fast，它支持 no_std
+crc32fast = { version = "1.4", default-features = false }
+
+[features]
+default = []
+std = []
+c-api = []  # C API 兼容层

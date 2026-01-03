@@ -1,0 +1,728 @@
+//! 块设备核心类型
+
+use crate::error::{Error, ErrorKind, Result};
+use alloc::vec;
+
+/// 块设备接口
+///
+/// 实现此 trait 以提供底层块设备访问。
+///
+/// # 示例
+///
+/// ```rust,ignore
+/// use lwext4_core::{BlockDevice, Result};
+///
+/// struct MyDevice {
+///     // ...
+/// }
+///
+/// impl BlockDevice for MyDevice {
+///     fn block_size(&self) -> u32 {
+///         4096
+///     }
+///
+///     fn sector_size(&self) -> u32 {
+///         512
+///     }
+///
+///     fn total_blocks(&self) -> u64 {
+///         1000000
+///     }
+///
+///     fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize> {
+///         // 实现块读取
+///         Ok(count as usize * self.sector_size() as usize)
+///     }
+///
+///     fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
+///         // 实现块写入
+///         Ok(count as usize * self.sector_size() as usize)
+///     }
+/// }
+/// ```
+pub trait BlockDevice {
+    /// 逻辑块大小（通常 4096）
+    fn block_size(&self) -> u32;
+
+    /// 物理扇区大小（通常 512）
+    fn sector_size(&self) -> u32;
+
+    /// 总块数
+    fn total_blocks(&self) -> u64;
+
+    /// 读取扇区
+    ///
+    /// # 参数
+    ///
+    /// * `lba` - 逻辑块地址（以扇区为单位）
+    /// * `count` - 要读取的扇区数
+    /// * `buf` - 目标缓冲区（大小至少为 count * sector_size）
+    ///
+    /// # 返回
+    ///
+    /// 成功返回实际读取的字节数
+    fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize>;
+
+    /// 写入扇区
+    ///
+    /// # 参数
+    ///
+    /// * `lba` - 逻辑块地址（以扇区为单位）
+    /// * `count` - 要写入的扇区数
+    /// * `buf` - 源缓冲区（大小至少为 count * sector_size）
+    ///
+    /// # 返回
+    ///
+    /// 成功返回实际写入的字节数
+    fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<usize>;
+
+    /// 刷新缓存
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// 是否只读
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// 打开设备
+    ///
+    /// 在开始使用设备前调用，用于初始化设备资源。
+    /// 默认实现什么都不做，设备可以根据需要覆盖此方法。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// impl BlockDevice for MyDevice {
+    ///     fn open(&mut self) -> Result<()> {
+    ///         // 打开文件、初始化硬件等
+    ///         self.file = File::open(&self.path)?;
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    fn open(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// 关闭设备
+    ///
+    /// 在停止使用设备后调用，用于清理设备资源。
+    /// 默认实现什么都不做，设备可以根据需要覆盖此方法。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// impl BlockDevice for MyDevice {
+    ///     fn close(&mut self) -> Result<()> {
+    ///         // 刷新并关闭文件、释放资源等
+    ///         self.flush()?;
+    ///         self.file.close()?;
+    ///         Ok(())
+    ///     }
+    /// }
+    /// ```
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// 块设备包装器
+///
+/// 为 ext4 文件系统提供块级访问，包含统计信息。
+///
+/// # 并发使用
+///
+/// BlockDev 本身不包含内部锁，在单线程环境中可以直接使用。
+/// 对于多线程环境，用户应该使用 `DeviceLock` trait 包装 BlockDev：
+///
+/// ```rust,ignore
+/// use std::sync::{Arc, Mutex};
+///
+/// // 单线程
+/// let mut block_dev = BlockDev::new(device)?;
+///
+/// // 多线程
+/// let block_dev = Arc::new(Mutex::new(BlockDev::new(device)?));
+/// ```
+///
+/// 对应 lwext4 的 `ext4_block_dev_lock/unlock` API
+pub struct BlockDev<D> {
+    /// 底层设备
+    device: D,
+    /// 分区偏移（字节）
+    partition_offset: u64,
+    /// 分区大小（字节）
+    partition_size: u64,
+    /// 逻辑读取次数（包括缓存命中）
+    read_count: u64,
+    /// 逻辑写入次数（包括缓存写入）
+    write_count: u64,
+    /// 物理读取次数（实际设备操作）
+    physical_read_count: u64,
+    /// 物理写入次数（实际设备操作）
+    physical_write_count: u64,
+    /// 引用计数（用于跟踪设备使用）
+    ref_count: u32,
+    /// 块缓存（可选）
+    pub(super) bcache: Option<crate::cache::BlockCache>,
+}
+
+impl<D: BlockDevice> BlockDev<D> {
+    /// 创建新的块设备包装器（无缓存）
+    pub fn new(device: D) -> Result<Self> {
+        let block_size = device.block_size();
+        let sector_size = device.sector_size();
+
+        // 验证块大小是扇区大小的整数倍
+        if block_size % sector_size != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Block size must be a multiple of sector size",
+            ));
+        }
+
+        let total_blocks = device.total_blocks();
+        let partition_size = total_blocks * block_size as u64;
+
+        Ok(Self {
+            device,
+            partition_offset: 0,
+            partition_size,
+            read_count: 0,
+            write_count: 0,
+            physical_read_count: 0,
+            physical_write_count: 0,
+            ref_count: 0,
+            bcache: None,
+        })
+    }
+
+    /// 创建带缓存的块设备包装器
+    ///
+    /// # 参数
+    ///
+    /// * `device` - 底层块设备
+    /// * `cache_blocks` - 缓存块数量
+    pub fn new_with_cache(device: D, cache_blocks: usize) -> Result<Self> {
+        let mut bd = Self::new(device)?;
+        let block_size = bd.block_size() as usize;
+        bd.bcache = Some(crate::cache::BlockCache::new(cache_blocks, block_size));
+        Ok(bd)
+    }
+
+    /// 创建使用默认缓存大小的块设备包装器
+    ///
+    /// 使用 `DEFAULT_CACHE_SIZE` (8 块) 作为缓存大小
+    pub fn with_default_cache(device: D) -> Result<Self> {
+        Self::new_with_cache(device, crate::cache::DEFAULT_CACHE_SIZE)
+    }
+
+    /// 创建指定分区的块设备包装器（无缓存）
+    ///
+    /// # 参数
+    ///
+    /// * `device` - 底层块设备
+    /// * `offset` - 分区起始偏移（字节）
+    /// * `size` - 分区大小（字节）
+    pub fn new_partition(device: D, offset: u64, size: u64) -> Result<Self> {
+        let mut bd = Self::new(device)?;
+        bd.set_partition(offset, size);
+        Ok(bd)
+    }
+
+    /// 创建指定分区且带缓存的块设备包装器
+    ///
+    /// # 参数
+    ///
+    /// * `device` - 底层块设备
+    /// * `offset` - 分区起始偏移（字节）
+    /// * `size` - 分区大小（字节）
+    /// * `cache_blocks` - 缓存块数量
+    pub fn new_partition_with_cache(
+        device: D,
+        offset: u64,
+        size: u64,
+        cache_blocks: usize,
+    ) -> Result<Self> {
+        let mut bd = Self::new_with_cache(device, cache_blocks)?;
+        bd.set_partition(offset, size);
+        Ok(bd)
+    }
+
+    /// 获取底层设备的引用
+    pub fn device(&self) -> &D {
+        &self.device
+    }
+
+    /// 获取底层设备的可变引用
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.device
+    }
+
+    /// 获取逻辑块大小
+    pub fn block_size(&self) -> u32 {
+        self.device.block_size()
+    }
+
+    /// 获取物理扇区大小
+    pub fn sector_size(&self) -> u32 {
+        self.device.sector_size()
+    }
+
+    /// 获取总块数
+    pub fn total_blocks(&self) -> u64 {
+        self.device.total_blocks()
+    }
+
+    /// 获取逻辑读取次数（包括缓存命中）
+    pub fn read_count(&self) -> u64 {
+        self.read_count
+    }
+
+    /// 获取逻辑写入次数（包括缓存写入）
+    pub fn write_count(&self) -> u64 {
+        self.write_count
+    }
+
+    /// 获取物理读取次数（实际设备操作）
+    ///
+    /// 对应 lwext4 的 `bread_ctr`
+    pub fn physical_read_count(&self) -> u64 {
+        self.physical_read_count
+    }
+
+    /// 获取物理写入次数（实际设备操作）
+    ///
+    /// 对应 lwext4 的 `bwrite_ctr`
+    pub fn physical_write_count(&self) -> u64 {
+        self.physical_write_count
+    }
+
+    /// 获取缓存命中率
+    ///
+    /// 返回 0.0 到 1.0 之间的值，表示缓存命中的百分比
+    pub fn cache_hit_rate(&self) -> f64 {
+        if self.read_count == 0 {
+            return 0.0;
+        }
+        let hits = self.read_count.saturating_sub(self.physical_read_count);
+        hits as f64 / self.read_count as f64
+    }
+
+    /// 设置分区偏移和大小
+    ///
+    /// # 参数
+    ///
+    /// * `offset` - 分区起始偏移（字节）
+    /// * `size` - 分区大小（字节）
+    pub fn set_partition(&mut self, offset: u64, size: u64) {
+        self.partition_offset = offset;
+        self.partition_size = size;
+    }
+
+    /// 获取分区偏移
+    pub fn partition_offset(&self) -> u64 {
+        self.partition_offset
+    }
+
+    /// 获取分区大小
+    pub fn partition_size(&self) -> u64 {
+        self.partition_size
+    }
+
+    // 内部辅助方法
+
+    /// 将逻辑块地址转换为物理扇区地址
+    pub(super) fn logical_to_physical(&self, lba: u64) -> u64 {
+        let block_size = self.device.block_size() as u64;
+        let sector_size = self.device.sector_size() as u64;
+        (lba * block_size + self.partition_offset) / sector_size
+    }
+
+    /// 每个逻辑块包含的物理扇区数
+    pub(super) fn sectors_per_block(&self) -> u32 {
+        self.device.block_size() / self.device.sector_size()
+    }
+
+    /// 增加读计数
+    pub(super) fn inc_read_count(&mut self) {
+        self.read_count += 1;
+    }
+
+    /// 增加写计数
+    pub(super) fn inc_write_count(&mut self) {
+        self.write_count += 1;
+    }
+
+    /// 增加物理读计数
+    pub(super) fn inc_physical_read_count(&mut self) {
+        self.physical_read_count += 1;
+    }
+
+    /// 增加物理写计数
+    pub(super) fn inc_physical_write_count(&mut self) {
+        self.physical_write_count += 1;
+    }
+
+    /// 刷新指定逻辑块地址的缓存
+    ///
+    /// # 参数
+    ///
+    /// * `lba` - 逻辑块地址
+    ///
+    /// # 返回
+    ///
+    /// 成功返回 Ok(())
+    ///
+    /// # 错误
+    ///
+    /// 如果块不在缓存中或写入失败，返回错误
+    pub fn flush_lba(&mut self, lba: u64) -> Result<()> {
+        if let Some(cache) = &mut self.bcache {
+            let sector_size = self.device.sector_size();
+            let partition_offset = self.partition_offset;
+            cache.flush_lba(lba, &mut self.device, sector_size, partition_offset)?;
+        }
+        Ok(())
+    }
+
+    // ===== 直接访问接口（绕过缓存）=====
+
+    /// 直接读取块（绕过缓存）
+    ///
+    /// 对应 lwext4 的 `ext4_blocks_get_direct`
+    ///
+    /// 这个方法直接从设备读取数据，不经过缓存。主要用于：
+    /// - 读取元数据（如超级块、组描述符）
+    /// - 实现特殊的 I/O 策略
+    /// - 避免污染缓存
+    ///
+    /// # 参数
+    ///
+    /// * `lba` - 起始逻辑块地址
+    /// * `count` - 要读取的块数
+    /// * `buf` - 目标缓冲区
+    ///
+    /// # 返回
+    ///
+    /// 成功返回读取的字节数
+    pub fn read_blocks_direct(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize> {
+        let block_size = self.device.block_size();
+        let required_size = count as usize * block_size as usize;
+
+        if buf.len() < required_size {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Buffer too small for requested blocks",
+            ));
+        }
+
+        // 转换为物理扇区地址
+        let pba = self.logical_to_physical(lba);
+        let sectors_per_block = self.sectors_per_block();
+        let sector_count = count * sectors_per_block;
+
+        // 直接从设备读取
+        self.inc_read_count();
+        self.inc_physical_read_count();
+        self.device.read_blocks(pba, sector_count, buf)
+    }
+
+    /// 直接写入块（绕过缓存）
+    ///
+    /// 对应 lwext4 的 `ext4_blocks_set_direct`
+    ///
+    /// 这个方法直接写入设备，不经过缓存。主要用于：
+    /// - 写入元数据（如超级块、组描述符）
+    /// - 实现特殊的 I/O 策略
+    /// - 确保数据立即持久化
+    ///
+    /// # 参数
+    ///
+    /// * `lba` - 起始逻辑块地址
+    /// * `count` - 要写入的块数
+    /// * `buf` - 源数据缓冲区
+    ///
+    /// # 返回
+    ///
+    /// 成功返回写入的字节数
+    pub fn write_blocks_direct(&mut self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
+        let block_size = self.device.block_size();
+        let required_size = count as usize * block_size as usize;
+
+        if buf.len() < required_size {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Buffer too small for requested blocks",
+            ));
+        }
+
+        // 转换为物理扇区地址
+        let pba = self.logical_to_physical(lba);
+        let sectors_per_block = self.sectors_per_block();
+        let sector_count = count * sectors_per_block;
+
+        // 直接写入设备
+        self.inc_write_count();
+        self.inc_physical_write_count();
+        self.device.write_blocks(pba, sector_count, buf)
+    }
+
+    /// 直接读取字节（绕过缓存）
+    ///
+    /// 对应 lwext4 的 `ext4_block_readbytes`
+    ///
+    /// # 参数
+    ///
+    /// * `offset` - 字节偏移量
+    /// * `buf` - 目标缓冲区
+    ///
+    /// # 返回
+    ///
+    /// 成功返回读取的字节数
+    pub fn read_bytes_direct(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let len = buf.len();
+        let block_size = self.device.block_size() as u64;
+
+        // 计算起始块和块内偏移
+        let start_block = offset / block_size;
+        let block_offset = (offset % block_size) as usize;
+
+        // 计算需要读取的块数
+        let total_size = block_offset + len;
+        let block_count = ((total_size as u64 + block_size - 1) / block_size) as u32;
+
+        // 分配临时缓冲区
+        let mut temp = alloc::vec![0u8; block_count as usize * block_size as usize];
+
+        // 直接读取所有相关块
+        self.read_blocks_direct(start_block, block_count, &mut temp)?;
+
+        // 复制所需字节
+        buf.copy_from_slice(&temp[block_offset..block_offset + len]);
+
+        Ok(len)
+    }
+
+    /// 直接写入字节（绕过缓存）
+    ///
+    /// 对应 lwext4 的 `ext4_block_writebytes`
+    ///
+    /// # 参数
+    ///
+    /// * `offset` - 字节偏移量
+    /// * `buf` - 源数据缓冲区
+    ///
+    /// # 返回
+    ///
+    /// 成功返回写入的字节数
+    pub fn write_bytes_direct(&mut self, offset: u64, buf: &[u8]) -> Result<usize> {
+        let len = buf.len();
+        let block_size = self.device.block_size() as u64;
+
+        let start_block = offset / block_size;
+        let block_offset = (offset % block_size) as usize;
+
+        let total_size = block_offset + len;
+        let block_count = ((total_size as u64 + block_size - 1) / block_size) as u32;
+
+        let mut temp = alloc::vec![0u8; block_count as usize * block_size as usize];
+
+        // 如果不是块对齐，需要先读取现有数据
+        if block_offset != 0 || len % block_size as usize != 0 {
+            // 忽略读取错误（可能是新块）
+            let _ = self.read_blocks_direct(start_block, block_count, &mut temp);
+        }
+
+        // 写入数据到临时缓冲区
+        temp[block_offset..block_offset + len].copy_from_slice(buf);
+
+        // 直接写回所有块
+        self.write_blocks_direct(start_block, block_count, &temp)?;
+
+        Ok(len)
+    }
+
+    // ===== 缓存管理接口 =====
+
+    /// 获取缓存统计信息
+    ///
+    /// # 返回
+    ///
+    /// 如果启用了缓存，返回 Some(CacheStats)，否则返回 None
+    pub fn cache_stats(&self) -> Option<crate::cache::CacheStats> {
+        self.bcache.as_ref().map(|cache| cache.stats())
+    }
+
+    /// 检查是否启用了缓存
+    pub fn has_cache(&self) -> bool {
+        self.bcache.is_some()
+    }
+
+    /// 使块缓存失效（从缓存中移除）
+    ///
+    /// # 参数
+    ///
+    /// * `lba` - 逻辑块地址
+    ///
+    /// # 返回
+    ///
+    /// 成功返回 Ok(())
+    pub fn invalidate_cache_block(&mut self, lba: u64) -> Result<()> {
+        if let Some(cache) = &mut self.bcache {
+            cache.invalidate_buffer(lba)?;
+        }
+        Ok(())
+    }
+
+    /// 使一组连续块的缓存失效
+    ///
+    /// # 参数
+    ///
+    /// * `from` - 起始逻辑块地址
+    /// * `count` - 块数量
+    ///
+    /// # 返回
+    ///
+    /// 成功返回失效的块数量
+    pub fn invalidate_cache_range(&mut self, from: u64, count: u32) -> Result<usize> {
+        if let Some(cache) = &mut self.bcache {
+            return cache.invalidate_range(from, count);
+        }
+        Ok(0)
+    }
+
+    // ===== 写回模式控制 =====
+
+    /// 启用缓存写回模式
+    ///
+    /// 对应 lwext4 的 `ext4_block_cache_write_back(bdev, 1)`
+    ///
+    /// 启用后，修改的块会保留在缓存中，直到显式刷新或驱逐。
+    /// 可以嵌套调用以实现引用计数式的写回控制。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// // 开始批量写操作
+    /// block_dev.enable_write_back();
+    ///
+    /// // 执行多次写操作（延迟写入磁盘）
+    /// block_dev.write_block(0, &data1)?;
+    /// block_dev.write_block(1, &data2)?;
+    ///
+    /// // 结束批量操作，刷新所有脏块
+    /// block_dev.disable_write_back()?;
+    /// ```
+    pub fn enable_write_back(&mut self) {
+        if let Some(cache) = &mut self.bcache {
+            cache.enable_write_back();
+        }
+    }
+
+    /// 禁用缓存写回模式
+    ///
+    /// 对应 lwext4 的 `ext4_block_cache_write_back(bdev, 0)`
+    ///
+    /// 如果引用计数降为 0，会自动刷新所有脏块到设备。
+    ///
+    /// # 返回
+    ///
+    /// 成功返回刷新的块数量，如果仍处于写回模式则返回 0
+    pub fn disable_write_back(&mut self) -> Result<usize> {
+        if let Some(cache) = &mut self.bcache {
+            let sector_size = self.device.sector_size();
+            let partition_offset = self.partition_offset;
+            return cache.disable_write_back(&mut self.device, sector_size, partition_offset);
+        }
+        Ok(0)
+    }
+
+    /// 检查是否启用写回模式
+    pub fn is_write_back_enabled(&self) -> bool {
+        self.bcache
+            .as_ref()
+            .map(|cache| cache.is_write_back_enabled())
+            .unwrap_or(false)
+    }
+
+    /// 获取写回模式引用计数
+    pub fn write_back_counter(&self) -> u32 {
+        self.bcache
+            .as_ref()
+            .map(|cache| cache.write_back_counter())
+            .unwrap_or(0)
+    }
+
+    /// 打开底层设备
+    ///
+    /// 调用底层设备的 `open()` 方法进行初始化。
+    /// 对应 lwext4 的 `ext4_block_init`
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// let mut block_dev = BlockDev::new(device)?;
+    /// block_dev.open()?; // 初始化设备资源
+    /// // ... 使用设备 ...
+    /// block_dev.close()?; // 清理设备资源
+    /// ```
+    pub fn open(&mut self) -> Result<()> {
+        self.device.open()
+    }
+
+    /// 关闭底层设备
+    ///
+    /// 先刷新所有缓存，然后调用底层设备的 `close()` 方法。
+    /// 对应 lwext4 的 `ext4_block_fini`
+    ///
+    /// # 返回
+    ///
+    /// 如果刷新或关闭失败则返回错误
+    pub fn close(&mut self) -> Result<()> {
+        // 先刷新所有数据
+        self.flush()?;
+        // 然后关闭设备
+        self.device.close()
+    }
+
+    /// 增加引用计数
+    ///
+    /// 对应 lwext4 的内部引用计数管理。
+    /// 当有新的组件开始使用此设备时调用。
+    ///
+    /// # 示例
+    ///
+    /// ```rust,ignore
+    /// block_dev.get(); // 增加引用计数
+    /// // ... 使用设备 ...
+    /// block_dev.put(); // 减少引用计数
+    /// ```
+    pub fn get(&mut self) {
+        self.ref_count = self.ref_count.saturating_add(1);
+    }
+
+    /// 减少引用计数
+    ///
+    /// 当组件停止使用此设备时调用。
+    /// 使用饱和减法，计数不会低于 0。
+    pub fn put(&mut self) {
+        self.ref_count = self.ref_count.saturating_sub(1);
+    }
+
+    /// 获取当前引用计数
+    ///
+    /// 返回值表示当前有多少组件正在使用此设备。
+    pub fn ref_count(&self) -> u32 {
+        self.ref_count
+    }
+
+    /// 检查设备是否正在被引用
+    ///
+    /// 如果引用计数大于 0，返回 true
+    pub fn is_referenced(&self) -> bool {
+        self.ref_count > 0
+    }
+}

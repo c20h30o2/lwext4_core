@@ -1,0 +1,5 @@
+[toolchain]
+# 与 ArceOS 保持一致的工具链版本
+profile = "minimal"
+channel = "nightly-2025-05-20"
+components = ["rust-src", "rustfmt", "clippy"]
