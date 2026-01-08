@@ -194,6 +194,7 @@ fn find_next_allocated_block<D: BlockDevice>(
 ///
 /// * `inode_ref` - Inode 引用
 /// * `logical_block` - 要分配的逻辑块号
+/// * `cached_extent_opt` - 可选的已查找的extent结果（性能优化）
 ///
 /// # 返回
 ///
@@ -203,12 +204,22 @@ fn find_next_allocated_block<D: BlockDevice>(
 ///
 /// 1. 如果存在相邻的 extent，尝试在其后继续分配
 /// 2. 否则，使用 inode 所在块组的默认位置
+///
+/// # 性能优化
+///
+/// 如果调用者已经调用过 `find_extent_for_block`，可以通过 `cached_extent_opt` 传入结果，
+/// 避免重复查找，提升性能。
 fn find_goal<D: BlockDevice>(
     inode_ref: &mut InodeRef<D>,
     logical_block: u32,
+    cached_extent_opt: Option<Option<ext4_extent>>,
 ) -> Result<u64> {
-    // 尝试查找最接近的 extent
-    let extent_opt = find_extent_for_block(inode_ref, logical_block)?;
+    // 🚀 性能优化：使用缓存的查找结果，或者执行新查找
+    let extent_opt = if let Some(cached) = cached_extent_opt {
+        cached
+    } else {
+        find_extent_for_block(inode_ref, logical_block)?
+    };
 
     if let Some(extent) = extent_opt {
         let ee_block = u32::from_le(extent.block);
@@ -325,7 +336,8 @@ pub fn get_blocks<D: BlockDevice>(
     };
 
     // 3.2 计算分配目标（goal）
-    let goal = find_goal(inode_ref, logical_block)?;
+    // 🚀 性能优化：传入已经查找到的 extent_opt，避免在 find_goal 中重复查找
+    let goal = find_goal(inode_ref, logical_block, Some(extent_opt))?;
 
     // 3.3 分配物理块（支持批量分配）
     let (physical_block, actual_allocated) = balloc::alloc_blocks(
@@ -517,9 +529,11 @@ fn insert_extent_with_auto_split<D: BlockDevice>(
         // 深度 > 0 且未满，需要插入到叶子节点
         log::debug!("[EXTENT_INSERT] Depth={} and not full, inserting to leaf", depth);
 
-        // 读取 leaf_block（使用独立的 Block::get 避免 inode 缓存问题）
-        let leaf_block = read_first_leaf_block(inode_ref)?;
-        log::debug!("[EXTENT_INSERT] Read leaf_block from inode: 0x{:x}", leaf_block);
+        // 🔧 关键修复：根据 logical_block 查找正确的目标叶子块
+        // 不能使用 read_first_leaf_block，因为它总是返回第一个索引
+        // 必须遍历索引树找到包含 logical_block 的正确叶子
+        let leaf_block = find_target_leaf_block(inode_ref, logical_block)?;
+        log::debug!("[EXTENT_INSERT] Found target leaf block for logical={}: 0x{:x}", logical_block, leaf_block);
 
         insert_extent_to_leaf_direct(inode_ref, sb, allocator, leaf_block, logical_block, physical_block, length)?;
     }
@@ -527,7 +541,151 @@ fn insert_extent_with_auto_split<D: BlockDevice>(
     Ok(())
 }
 
+/// 根据 logical_block 查找目标叶子块
+///
+/// 🔧 关键修复：遍历索引树，找到应该包含 logical_block 的叶子块
+/// 不同于 read_first_leaf_block（总是返回第一个索引），这个函数会：
+/// 1. 读取根节点的所有索引
+/// 2. 选择最后一个 logical_block >= idx.block 的索引
+/// 3. 递归遍历直到找到叶子节点
+fn find_target_leaf_block<D: BlockDevice>(
+    inode_ref: &mut InodeRef<D>,
+    logical_block: u32,
+) -> Result<u64> {
+    // 读取根节点
+    let (current_block, root_depth) = inode_ref.with_inode_mut(|inode| -> Result<(u64, u16)> {
+        let header_ptr = inode.blocks.as_ptr() as *const ext4_extent_header;
+        let header = unsafe { &*header_ptr };
+
+        let depth = u16::from_le(header.depth);
+        if depth == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "find_target_leaf_block called on depth-0 tree",
+            ));
+        }
+
+        let entries = u16::from_le(header.entries);
+        let header_size = core::mem::size_of::<ext4_extent_header>();
+        let idx_size = core::mem::size_of::<ext4_extent_idx>();
+
+        // 遍历索引，找到最后一个 logical_block >= idx.block 的
+        let mut target_idx: Option<ext4_extent_idx> = None;
+
+        for i in 0..entries as usize {
+            let offset = header_size + i * idx_size;
+            let idx = unsafe {
+                *(inode.blocks.as_ptr().add(offset / 4) as *const ext4_extent_idx)
+            };
+
+            let idx_block = u32::from_le(idx.block);
+
+            log::debug!(
+                "[FIND_TARGET_LEAF] Index[{}]: idx_block={}, comparing with logical={}",
+                i, idx_block, logical_block
+            );
+
+            if logical_block >= idx_block {
+                target_idx = Some(idx);
+            } else {
+                break;
+            }
+        }
+
+        let idx = target_idx.ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "No suitable index found for logical block")
+        })?;
+
+        let child_block = super::helpers::ext4_idx_pblock(&idx);
+
+        log::debug!(
+            "[FIND_TARGET_LEAF] Selected child_block=0x{:x} for logical={}",
+            child_block, logical_block
+        );
+
+        Ok((child_block, depth))
+    })??;
+
+    // 递归遍历直到找到叶子节点（depth=0）
+    let leaf_block = traverse_to_leaf(inode_ref, current_block, root_depth - 1, logical_block)?;
+
+    Ok(leaf_block)
+}
+
+/// 递归遍历索引树直到找到叶子节点
+fn traverse_to_leaf<D: BlockDevice>(
+    inode_ref: &mut InodeRef<D>,
+    mut current_block: u64,
+    mut current_depth: u16,
+    logical_block: u32,
+) -> Result<u64> {
+    while current_depth > 0 {
+        let mut block = crate::block::Block::get(inode_ref.bdev(), current_block)?;
+
+        let child_block = block.with_data(|data| {
+            let header = unsafe {
+                &*(data.as_ptr() as *const crate::types::ext4_extent_header)
+            };
+
+            if !header.is_valid() {
+                return Err(crate::error::Error::new(
+                    ErrorKind::Corrupted,
+                    "Invalid extent header in index node",
+                ));
+            }
+
+            let node_depth = u16::from_le(header.depth);
+            let entries = u16::from_le(header.entries);
+
+            log::debug!(
+                "[TRAVERSE_LEAF] At block=0x{:x}, depth={}, entries={}, searching for logical={}",
+                current_block, node_depth, entries, logical_block
+            );
+
+            // 遍历索引，找到最后一个 logical_block >= idx.block 的
+            let header_size = core::mem::size_of::<crate::types::ext4_extent_header>();
+            let idx_size = core::mem::size_of::<crate::types::ext4_extent_idx>();
+
+            let mut target_idx: Option<crate::types::ext4_extent_idx> = None;
+
+            for i in 0..entries as usize {
+                let offset = header_size + i * idx_size;
+                let idx = unsafe {
+                    *(data[offset..].as_ptr() as *const crate::types::ext4_extent_idx)
+                };
+
+                let idx_block = u32::from_le(idx.block);
+
+                if logical_block >= idx_block {
+                    target_idx = Some(idx);
+                } else {
+                    break;
+                }
+            }
+
+            let idx = target_idx.ok_or_else(|| {
+                Error::new(ErrorKind::NotFound, "No suitable index in intermediate node")
+            })?;
+
+            let child = super::helpers::ext4_idx_pblock(&idx);
+
+            log::debug!("[TRAVERSE_LEAF] Selected child=0x{:x}", child);
+
+            Ok(child)
+        })??;
+
+        current_block = child_block;
+        current_depth -= 1;
+    }
+
+    log::debug!("[TRAVERSE_LEAF] Found leaf block: 0x{:x}", current_block);
+    Ok(current_block)
+}
+
 /// 读取 inode 中第一个索引的 leaf_block
+///
+/// ⚠️ 注意：这个函数总是返回第一个索引，不考虑 logical_block！
+/// 对于需要根据 logical_block 选择叶子的情况，应该使用 find_target_leaf_block
 ///
 /// 注意：使用 with_inode_mut 而非 with_inode 来读取，确保能看到最新的修改
 /// 即使我们不修改 inode，使用 mut 访问也能保证读到最新的 Block 缓存数据
@@ -751,7 +909,7 @@ fn try_insert_to_leaf_block<D: BlockDevice>(
         let header_size = core::mem::size_of::<ext4_extent_header>();
         let extent_size = core::mem::size_of::<ext4_extent>();
 
-        // 找到插入位置（保持排序）
+        // 找到插入位置（保持排序）并检查重复
         let mut insert_pos = entries_count as usize;
         for i in 0..entries_count as usize {
             let offset = header_size + i * extent_size;
@@ -759,7 +917,26 @@ fn try_insert_to_leaf_block<D: BlockDevice>(
                 &*(data[offset..].as_ptr() as *const ext4_extent)
             };
 
-            if u32::from_le(existing_extent.block) > logical_block {
+            let existing_block = u32::from_le(existing_extent.block);
+
+            // 🔧 关键修复：检查是否已存在相同的逻辑块
+            if existing_block == logical_block {
+                // 逻辑块已存在，这是一个严重错误
+                // 不应该重复插入相同的逻辑块
+                log::error!(
+                    "[EXTENT_INSERT] DUPLICATE DETECTED: logical_block={} already exists at pos {}, \
+                     existing_physical=0x{:x}, new_physical=0x{:x}",
+                    logical_block, i,
+                    crate::extent::helpers::ext4_ext_pblock(existing_extent),
+                    physical_block
+                );
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Extent for this logical block already exists (duplicate insert prevented)",
+                ));
+            }
+
+            if existing_block > logical_block {
                 insert_pos = i;
                 break;
             }
@@ -1062,7 +1239,7 @@ pub(crate) fn insert_extent_simple<D: BlockDevice>(
         let extent_size = core::mem::size_of::<ext4_extent>();
         let new_block = u32::from_le(extent.block);
 
-        // 找到正确的插入位置（保持逻辑块号升序）
+        // 找到正确的插入位置（保持逻辑块号升序）并检查重复
         let mut insert_pos = entries as usize;
         for i in 0..entries as usize {
             let offset = header_size + i * extent_size;
@@ -1070,6 +1247,23 @@ pub(crate) fn insert_extent_simple<D: BlockDevice>(
                 *(inode.blocks.as_ptr().add(offset / 4) as *const ext4_extent)
             };
             let existing_block = u32::from_le(existing_extent.block);
+
+            // 🔧 关键修复：检查是否已存在相同的逻辑块
+            if existing_block == new_block {
+                // 逻辑块已存在，这是一个严重错误
+                // 不应该重复插入相同的逻辑块
+                let existing_physical = crate::extent::helpers::ext4_ext_pblock(&existing_extent);
+                let new_physical = crate::extent::helpers::ext4_ext_pblock(extent);
+                log::error!(
+                    "[EXTENT_INSERT_SIMPLE] DUPLICATE DETECTED: logical_block={} already exists at pos {}, \
+                     existing_physical=0x{:x}, new_physical=0x{:x}",
+                    new_block, i, existing_physical, new_physical
+                );
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Extent for this logical block already exists in root (duplicate insert prevented)",
+                ));
+            }
 
             if new_block < existing_block {
                 insert_pos = i;
@@ -1143,15 +1337,33 @@ fn find_extent_for_block<D: BlockDevice>(
     };
 
     let depth = u16::from_le(header.depth);
+    let entries = u16::from_le(header.entries);
+    let max = u16::from_le(header.max);
+
+    log::debug!(
+        "[FIND_EXTENT] Searching for logical={}, root: depth={}, entries={}/{}, inode.blocks[0..28]={:02x?}",
+        logical_block, depth, entries, max, &root_data[..28]
+    );
 
     // 根据深度选择查找方式
     if depth == 0 {
         // 叶子节点：直接在根节点中查找
-        return find_extent_in_leaf(&root_data, logical_block);
+        let result = find_extent_in_leaf(&root_data, logical_block)?;
+        log::debug!(
+            "[FIND_EXTENT] depth=0, result={:?}",
+            result.as_ref().map(|e| (u32::from_le(e.block), u16::from_le(e.len)))
+        );
+        return Ok(result);
     }
 
     // 多层树：需要遍历索引节点
-    find_extent_in_multilevel_tree(inode_ref, &root_data, &header, logical_block)
+    let result = find_extent_in_multilevel_tree(inode_ref, &root_data, &header, logical_block)?;
+    log::debug!(
+        "[FIND_EXTENT] depth={}, result={:?}",
+        depth,
+        result.as_ref().map(|e| (u32::from_le(e.block), u16::from_le(e.len)))
+    );
+    Ok(result)
 }
 
 /// 在多层 extent 树中查找 extent
@@ -1163,17 +1375,25 @@ fn find_extent_in_multilevel_tree<D: BlockDevice>(
     header: &ext4_extent_header,
     logical_block: u32,
 ) -> Result<Option<ext4_extent>> {
+    let depth = u16::from_le(header.depth);
+    let entries = u16::from_le(header.entries);
+
+    log::debug!(
+        "[FIND_EXTENT_MULTI] depth={}, entries={}, searching for logical={}",
+        depth, entries, logical_block
+    );
+
     // 如果已经是叶子节点，直接查找
     if header.is_leaf() {
+        log::debug!("[FIND_EXTENT_MULTI] Node is leaf, searching in leaf");
         return find_extent_in_leaf(node_data, logical_block);
     }
 
     // 索引节点：查找指向目标块的索引
-    let entries = u16::from_le(header.entries);
     let header_size = core::mem::size_of::<ext4_extent_header>();
     let idx_size = core::mem::size_of::<ext4_extent_idx>();
 
-    let mut target_idx: Option<ext4_extent_idx> = None;
+    let mut target_idx: Option<(ext4_extent_idx, usize)> = None;
 
     for i in 0..entries as usize {
         let offset = header_size + i * idx_size;
@@ -1191,22 +1411,35 @@ fn find_extent_in_multilevel_tree<D: BlockDevice>(
         };
 
         let idx_block = u32::from_le(idx.block);
+        let leaf_lo = u32::from_le(idx.leaf_lo);
+        let leaf_hi = u16::from_le(idx.leaf_hi);
+        let child_block = (leaf_hi as u64) << 32 | (leaf_lo as u64);
+
+        log::debug!(
+            "[FIND_EXTENT_MULTI] Index[{}]: idx_block={}, child_block=0x{:x}",
+            i, idx_block, child_block
+        );
 
         // 找到最后一个 logical_block >= idx.block 的索引
         if logical_block >= idx_block {
-            target_idx = Some(idx);
+            target_idx = Some((idx, i));
         } else {
             break;
         }
     }
 
-    if let Some(idx) = target_idx {
+    if let Some((idx, idx_num)) = target_idx {
         // 读取子节点
         let child_block = {
             let leaf_lo = u32::from_le(idx.leaf_lo);
             let leaf_hi = u16::from_le(idx.leaf_hi);
             (leaf_hi as u64) << 32 | (leaf_lo as u64)
         };
+
+        log::debug!(
+            "[FIND_EXTENT_MULTI] Selected index[{}], reading child block 0x{:x}",
+            idx_num, child_block
+        );
 
         let mut block = Block::get(inode_ref.bdev(), child_block)?;
 
@@ -1231,9 +1464,17 @@ fn find_extent_in_multilevel_tree<D: BlockDevice>(
             ));
         }
 
+        let child_depth = u16::from_le(child_header.depth);
+        let child_entries = u16::from_le(child_header.entries);
+        log::debug!(
+            "[FIND_EXTENT_MULTI] Child node: depth={}, entries={}",
+            child_depth, child_entries
+        );
+
         // 递归查找
         find_extent_in_multilevel_tree(inode_ref, &child_data, &child_header, logical_block)
     } else {
+        log::debug!("[FIND_EXTENT_MULTI] No suitable index found, returning None");
         Ok(None)
     }
 }
@@ -1242,6 +1483,11 @@ fn find_extent_in_multilevel_tree<D: BlockDevice>(
 fn find_extent_in_leaf(node_data: &[u8], logical_block: u32) -> Result<Option<ext4_extent>> {
     let header = unsafe { *(node_data.as_ptr() as *const ext4_extent_header) };
     let entries = u16::from_le(header.entries);
+
+    log::debug!(
+        "[FIND_EXTENT_LEAF] Searching in leaf: entries={}, logical={}",
+        entries, logical_block
+    );
 
     let header_size = core::mem::size_of::<ext4_extent_header>();
     let extent_size = core::mem::size_of::<ext4_extent>();
@@ -1261,10 +1507,16 @@ fn find_extent_in_leaf(node_data: &[u8], logical_block: u32) -> Result<Option<ex
 
         // 检查逻辑块是否在这个 extent 范围内
         if logical_block >= ee_block && logical_block < ee_block + ee_len as u32 {
+            log::debug!(
+                "[FIND_EXTENT_LEAF] Found at entry[{}]: range=[{}-{}], physical=0x{:x}",
+                i, ee_block, ee_block + ee_len as u32 - 1,
+                crate::extent::helpers::ext4_ext_pblock(&extent)
+            );
             return Ok(Some(extent));
         }
     }
 
+    log::debug!("[FIND_EXTENT_LEAF] Not found in leaf");
     Ok(None)
 }
 

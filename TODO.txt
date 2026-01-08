@@ -1,2 +1,31 @@
 1.尝试使用现有的 lru crate 替换当前的block cache lru的简单实现， 并且进一步验证启用cache时的一致性与可靠性
-2.
+2.删除capi等不打算继续实现的模块
+更多代办：cache修复与优化 常用文件命令自动化全面测试脚本 日志功能整合 复杂功能支持 高级功能支持 性能优化
+启用cache后：
+starry:~# apk add vim
+[  5.545231 0:10 starry_api::syscall::fs::fd_ops:138] [OPEN] openat FAILED: path=/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
+[  5.546202 0:10 starry_api::syscall::fs::fd_ops:138] [OPEN] openat FAILED: path=/usr/local/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
+[  5.638928 0:10 starry_api::syscall::fs::fd_ops:138] [OPEN] openat FAILED: path=etc/apk/cache, error=AxErrorKind::NotFound
+fetch https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main/riscv64/APKINDEX.tar.gz
+[  6.042771 0:10 axfs_ng::fs::ext4::wrapper:360] [ext4] READ FAILED: ino=26, len=4096, offset=507904, error=Ext4Error { code: 28, message: Some("All cache blocks are referenced, cannot evict") }
+[  6.045063 0:10 axfs_ng::fs::ext4::util:19] [ext4] Error occurred: code=28 (ENOSPC), message=Some("All cache blocks are referenced, cannot evict")
+[  6.046022 0:10 axfs_ng::fs::ext4::util:26] [ext4] Converted to VfsError: AxErrorKind::StorageFull
+[  6.046656 0:10 axfs_ng::highlevel::file:508] [CachedFile] page_or_insert: read FAILED for page 124, error=AxErrorKind::StorageFull
+[  6.047467 0:10 axmm::aspace:348] Failed to populate pages for VA:0x48838a (READ | EXECUTE | USER): No storage space
+Segmentation fault (core dumped)
+
+
+其他：探索修复好apk add vim的同时，apk update也被修复好的原因， 在做出这些修改之前， apk update 总是输出：
+starry:~# apk update
+[  6.881265 0:10 starry_api::syscall::fs::fd_ops:137] [OPEN] openat FAILED: path=/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
+[  6.882483 0:10 starry_api::syscall::fs::fd_ops:137] [OPEN] openat FAILED: path=/usr/local/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
+[  7.075933 0:10 starry_api::syscall::fs::fd_ops:137] [OPEN] openat FAILED: path=etc/apk/cache, error=AxErrorKind::NotFound
+fetch https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main/riscv64/APKINDEX.tar.gz
+fetch https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/community/riscv64/APKINDEX.tar.gz
+WARNING: opening from cache https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/community: No buffer space available
+[ 10.290026 0:10 starry_api::syscall::fs::fd_ops:137] [OPEN] openat FAILED: path=etc/apk/repositories.d, error=AxErrorKind::NotFound
+v3.22.2-323-g6078141c2a5 [https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main]
+v3.22.2-325-gffb20bd62d9 [https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/community]
+2 unavailable, 0 stale; 20185 distinct packages available
+
+现在则正常输出OK

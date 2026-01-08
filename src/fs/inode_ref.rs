@@ -282,6 +282,41 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
         Ok(())
     }
 
+    /// 强制写回 inode 到磁盘
+    ///
+    /// 🔧 关键修复：确保 inode 的修改被立即写入磁盘
+    /// 用于关键操作后强制持久化，例如 extent 树增长后
+    pub fn force_writeback(&mut self) -> Result<()> {
+        if !self.dirty {
+            // 没有修改，无需写回
+            return Ok(());
+        }
+
+        // 显式读取并写回 inode block
+        let mut block = crate::block::Block::get(self.bdev, self.inode_block_addr)?;
+
+        // 通过 with_data_mut 触发 dirty 标记，确保 block drop 时写回
+        block.with_data_mut(|_data| {
+            // 数据已经在之前的 with_inode_mut 中修改过
+            // 这里只是确保 block 被标记为 dirty
+        })?;
+
+        // 显式 drop block，触发写回
+        drop(block);
+
+        // 额外调用 flush 确保写入磁盘
+        self.bdev.flush()?;
+
+        self.dirty = false;
+
+        log::debug!(
+            "[InodeRef] force_writeback: ino={}, block_addr=0x{:x}",
+            self.inode_num, self.inode_block_addr
+        );
+
+        Ok(())
+    }
+
     // ===== 便捷方法 =====
 
     /// 获取文件大小

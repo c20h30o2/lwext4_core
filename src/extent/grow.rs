@@ -134,7 +134,18 @@ pub fn grow_tree_depth<D: BlockDevice>(
         new_block,
     )?;
 
-    log::debug!("[GROW_TREE] grow_tree_depth completed successfully");
+    // 🔧 关键修复：强制写回 inode 到磁盘
+    // grow_tree_depth 修改了 inode.blocks（extent 树的根节点），这是文件系统元数据的关键部分
+    // 必须确保这个修改被立即持久化，否则后续读取可能读到旧的树结构，导致数据损坏
+    log::debug!(
+        "[GROW_TREE] Force writeback inode after grow_tree_depth (critical for consistency)"
+    );
+    inode_ref.force_writeback().map_err(|e| {
+        log::error!("[GROW_TREE] Failed to force writeback after grow: {:?}", e);
+        e
+    })?;
+
+    log::debug!("[GROW_TREE] grow_tree_depth completed successfully with forced writeback");
 
     Ok(new_block)
 }
