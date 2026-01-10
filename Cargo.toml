@@ -17,6 +17,9 @@ bitflags = "2.4"
 # 使用 crc32fast，它支持 no_std
 crc32fast = { version = "1.4", default-features = false }
 
+# LRU缓存（用于块缓存）
+lru = "0.12"
+
 [features]
 default = []
 std = []

@@ -56,7 +56,7 @@ impl<D: BlockDevice> BlockDev<D> {
                 let (cache_buf, _is_new) = cache.alloc(lba)?;
                 cache_buf.data.copy_from_slice(&buf[..block_size as usize]);
                 cache_buf.mark_uptodate();
-                cache.free(lba)?;
+                // ✅ lru crate 自动管理生命周期，无需手动 free
             }
 
             return Ok(block_size as usize);
@@ -111,8 +111,7 @@ impl<D: BlockDevice> BlockDev<D> {
                     // 将块加入脏列表
                     cache.mark_dirty(lba)?;
 
-                    // 减少引用计数
-                    cache.free(lba)?;
+                    // ✅ lru crate 自动管理生命周期，无需手动 free
 
                     return Ok(buf.len());
                 }

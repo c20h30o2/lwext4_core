@@ -11,9 +11,9 @@ use crate::block::{BlockDevice, BlockDev};
 ///
 /// 提供 RAII 风格的块访问：
 /// - 获取时自动从缓存分配或从磁盘读取
-/// - 在持有期间，缓存块引用计数 > 0，不会被驱逐
+/// - 在持有期间，由于持有 `&mut BlockDev`，保证缓存块不会被其他操作访问
 /// - 修改时自动标记为脏
-/// - 丢弃时自动释放引用计数
+/// - 丢弃时释放对 BlockDev 的可变引用，lru crate 自动管理块生命周期
 /// - 一般用block获得某个缓存块的引用， 使用闭包操作缓存块中的数据
 /// - 由于block需要持有device的mut引用， 同一时刻应该只有一个block存在
 /// # 设计说明
@@ -68,11 +68,11 @@ impl<'a, D: BlockDevice> Block<'a, D> {
     /// # 缓存路径
     ///
     /// 1. 调用 `cache.alloc(lba)` 在缓存中分配块
-    ///    - 如果块已存在：`find_get()` 增加引用计数，返回现有块
+    ///    - 如果块已存在：返回现有块的可变引用
     ///    - 如果块不存在：分配新槽位（可能驱逐 LRU 块）
     /// 2. 如果是新分配的块，从磁盘读取数据到缓存块
-    /// 3. 不调用 `free()`，保持引用计数，防止块被驱逐
-    /// 4. 在 `Drop` 时调用 `free()` 释放引用
+    /// 3. Block 持有 `&mut BlockDev`，保证块在使用期间不被其他操作访问
+    /// 4. Drop 时释放可变引用，lru crate 自动管理块生命周期
     ///
     /// # 无缓存路径
     ///
@@ -95,27 +95,21 @@ impl<'a, D: BlockDevice> Block<'a, D> {
 
             if is_new {
                 // 新分配的块，需要从磁盘读取
-                // ⚠️ 不能调用 cache.free()！否则块会被加入 LRU 索引，可能在读取期间被驱逐
-                // 解决方案：先读取到临时缓冲区，然后通过 alloc 的引用填充数据
+                // ⚠️ 解决借用冲突：先读取到临时缓冲区，然后重新获取 cache 引用填充数据
+                // 第一次 alloc 的引用在调用 device_mut() 前必须结束，否则会有借用冲突
 
-                // 先读取数据到临时缓冲区（此时 refctr = 1，块不会被驱逐）
+                // 先读取数据到临时缓冲区
                 block_dev.inc_physical_read_count();
                 let mut temp_buf = alloc::vec![0u8; block_size];
                 block_dev.device_mut().read_blocks(pba, count, &mut temp_buf)?;
 
                 // 重新获取缓存块引用并填充数据
-                // 注意：第一次 alloc 的引用仍然有效（refctr = 1），
-                // 这里再次 alloc 会增加到 refctr = 2
                 let (cache_buf, _) = block_dev.bcache.as_mut().unwrap().alloc(lba)?;
                 cache_buf.data.copy_from_slice(&temp_buf);
                 cache_buf.mark_uptodate();
-                // 现在 refctr = 2（第一次 alloc + 第二次 alloc）
-                // Block::drop 会调用 free 一次 → refctr = 1
-                // 仍然 > 0，不会加入 LRU 索引
             }
 
-            // alloc() 内部已经调用 find_get() 增加了引用计数
-            // 不调用 free()，保持引用计数，在 drop 时才释放
+            // Block 持有 &mut BlockDev，保证缓存块不被其他操作访问
 
             Ok(Self {
                 block_dev,
@@ -153,7 +147,7 @@ impl<'a, D: BlockDevice> Block<'a, D> {
     /// 1. 调用 `cache.alloc(lba)` 在缓存中分配块
     /// 2. 如果是新块，**不从磁盘读取**
     /// 3. 标记为 `uptodate`（因为调用者会立即覆盖）
-    /// 4. 保持引用计数，drop 时释放
+    /// 4. Block 持有 `&mut BlockDev`，drop 时释放，lru crate 自动管理
     ///
     /// # 无缓存路径
     ///
@@ -173,8 +167,6 @@ impl<'a, D: BlockDevice> Block<'a, D> {
             // 不管是新块还是已存在，都标记为 uptodate
             // 因为调用者会立即覆盖整个块
             cache_buf.mark_uptodate();
-
-            // 保持引用计数，drop 时释放
 
             Ok(Self {
                 block_dev,
@@ -219,11 +211,9 @@ impl<'a, D: BlockDevice> Block<'a, D> {
     {
         if let Some(cache) = &mut self.block_dev.bcache {
             // 有缓存：临时获取缓存块引用
-            let (cache_buf, _) = cache.alloc(self.lba)?;  // refctr + 1
+            let (cache_buf, _) = cache.alloc(self.lba)?;
             let result = f(&cache_buf.data);
-            cache.free(self.lba)?;  // refctr - 1，平衡引用计数
-            // 注意：即使调用 free，如果 Block::get 持有引用（refctr >= 1），
-            // 块仍然不会被加入 LRU 索引（因为 refctr > 0）
+            // ✅ lru crate 自动管理生命周期，无需手动 free
             Ok(result)
         } else if let Some(data) = &self.local_data {
             // 无缓存：使用本地副本
@@ -251,15 +241,14 @@ impl<'a, D: BlockDevice> Block<'a, D> {
     {
         if let Some(cache) = &mut self.block_dev.bcache {
             // 有缓存：临时获取缓存块可变引用
-            let (cache_buf, _) = cache.alloc(self.lba)?;  // refctr + 1
+            let (cache_buf, _) = cache.alloc(self.lba)?;
             let result = f(&mut cache_buf.data);
             // 标记为脏
             cache_buf.mark_dirty();
             // 将块加入脏列表
             cache.mark_dirty(self.lba)?;
-            cache.free(self.lba)?;  // refctr - 1，平衡引用计数
-            // ✅ 关键修复：dirty 块即使 refctr = 0 也不会被加入 LRU（见 BlockCache::free）
-            // 这样 dirty 块会一直保留在缓存中，直到写回磁盘后才能被驱逐
+            // ✅ lru crate 自动管理生命周期，无需手动 free
+            // 脏块会在 dirty_set 中跟踪，flush 时会写回磁盘
             Ok(result)
         } else if let Some(data) = &mut self.local_data {
             // 无缓存：修改本地副本并标记为脏
@@ -283,11 +272,11 @@ impl<'a, D: BlockDevice> Block<'a, D> {
     /// 实际的释放逻辑
     fn do_release(&mut self) -> Result<()> {
         if self.held {
-            // 有缓存：释放引用计数
-            if let Some(cache) = &mut self.block_dev.bcache {
-                cache.free(self.lba)?;
-                self.held = false;
-            }
+            // 有缓存：lru crate 自动管理生命周期
+            // Block 不再需要显式释放引用计数
+            // 当 Block drop 时，对 BlockDev 的可变引用被释放，
+            // 缓存块可以被后续操作访问或驱逐
+            self.held = false;
         } else if self.local_dirty {
             // 无缓存且有修改：写回磁盘
             if let Some(data) = &self.local_data {
@@ -482,7 +471,7 @@ mod tests {
             block.with_data_mut(|data| {
                 data[0] = 0x99;
             }).unwrap();
-        } // 释放，引用计数降为 0
+        } // 释放，Block drop，&mut BlockDev 被释放
 
         // 第二次访问同一个块（应该还在缓存中）
         {
@@ -503,7 +492,7 @@ mod tests {
 
         {
             let _block = Block::get(&mut block_dev, 0).unwrap();
-            // block 在这里自动 drop，应该正确释放引用
+            // block 在这里自动 drop，释放 &mut BlockDev
         }
 
         // 验证可以再次获取

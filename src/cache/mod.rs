@@ -5,18 +5,19 @@
 //! # 主要组件
 //!
 //! - [`CacheBuffer`] - 单个缓存块，包含数据和元数据
-//! - [`BlockCache`] - 块缓存管理器，使用双索引（LBA + LRU）
+//! - [`BlockCache`] - 块缓存管理器，使用 lru crate 提供 LRU 驱逐
 //! - [`CacheFlags`] - 缓存块状态标志
 //! - [`CacheStats`] - 缓存统计信息
 //!
 //! # 设计原理
 //!
-//! 本模块是 lwext4 C 库中 `ext4_bcache.c` 的纯 Rust 重写。关键改进：
+//! 本模块使用成熟的 `lru` crate 替代手动实现 LRU 缓存。关键改进：
 //!
-//! 1. **数据结构**：使用 `BTreeMap` 替代嵌入式红黑树，更安全且性能相当
-//! 2. **内存安全**：使用索引替代原始指针，避免悬空指针和内存泄漏
+//! 1. **数据结构**：使用 `lru::LruCache` 替代手动的 BTreeMap 双索引
+//! 2. **内存安全**：无需手动管理引用计数，lru crate 自动管理生命周期
 //! 3. **类型安全**：使用强类型和 `bitflags` 替代 C 的 int 标志
-//! 4. **所有权**：Rust 的所有权系统确保缓存块不会被意外共享或修改
+//! 4. **性能**：O(1) 操作替代 O(log n)，无手动 LRU 维护开销
+//! 5. **可靠性**：使用经过充分测试的 lru crate，避免自实现的 bug
 //!
 //! # 与 lwext4 的对应关系
 //!
@@ -24,26 +25,25 @@
 //! |-----------------------------------|-----------------------------------|
 //! | `struct ext4_buf`                 | [`CacheBuffer`]                   |
 //! | `struct ext4_bcache`              | [`BlockCache`]                    |
-//! | `RB_HEAD(lba_root)`               | `BTreeMap<u64, BufferId>`         |
-//! | `RB_HEAD(lru_root)`               | `BTreeMap<u32, BufferId>`         |
-//! | `SLIST_HEAD(dirty_list)`          | `VecDeque<BufferId>`              |
+//! | `RB_HEAD(lba_root)`               | `LruCache<u64, CacheBuffer>`      |
+//! | `RB_HEAD(lru_root)`               | *(lru crate 内部)*                 |
+//! | `SLIST_HEAD(dirty_list)`          | `BTreeSet<u64>`                   |
 //! | `ext4_bcache_alloc()`             | [`BlockCache::alloc()`]           |
-//! | `ext4_bcache_free()`              | [`BlockCache::free()`]            |
-//! | `ext4_bcache_find_get()`          | [`BlockCache::find_get()`]        |
-//! | `ext4_buf_lowest_lru()`           | [`BlockCache::lowest_lru()`]      |
+//! | `ext4_bcache_free()`              | *(不再需要)*                       |
+//! | `ext4_bcache_find_get()`          | *(合并到 alloc)*                   |
+//! | `ext4_buf_lowest_lru()`           | *(lru crate 内部)*                 |
 //! | `ext4_bcache_invalidate_lba()`    | [`BlockCache::invalidate_buffer()`]|
 //! | `ext4_block_cache_flush()`        | [`BlockCache::flush_all()`]       |
 //!
 //! # 功能完整性
 //!
-//! ✅ LBA 索引（快速查找）
-//! ✅ LRU 驱逐策略
-//! ✅ 引用计数
+//! ✅ LBA 索引（O(1) 快速查找）
+//! ✅ LRU 驱逐策略（lru crate 自动管理）
+//! ❌ 引用计数（不再需要，Rust 借用检查器保证安全）
 //! ✅ 脏块跟踪
 //! ✅ 范围失效
 //! ✅ 异步写入回调
-//! ✅ 驱逐控制（dont_shake）
-//! ✅ 引用限制（max_ref_blocks）
+//! ✅ 缓存统计信息
 //!
 //! # 使用示例
 //!
@@ -66,11 +66,10 @@
 //! buf.mark_dirty();
 //! cache.mark_dirty(100)?;
 //!
-//! // 释放块（减少引用计数）
-//! cache.free(100)?;
+//! // ✅ 不再需要手动 free，lru crate 自动管理
 //!
 //! // 刷新所有脏块
-//! cache.flush_all(&mut block_device)?;
+//! cache.flush_all(&mut block_device, sector_size, partition_offset)?;
 //!
 //! // 查看统计信息
 //! let stats = cache.stats();
@@ -80,13 +79,12 @@
 //!
 //! # 性能特性
 //!
-//! - **查找**: O(log n) - BTreeMap 查找
-//! - **插入**: O(log n) - BTreeMap 插入
-//! - **LRU 查找**: O(log n) - BTreeMap 最小键查找
-//! - **驱逐**: O(log n) - LRU 查找 + 删除
+//! - **查找**: O(1) - HashMap 查找（lru crate 内部）
+//! - **插入**: O(1) - HashMap 插入 + LRU 链表更新
+//! - **LRU 驱逐**: O(1) - 直接访问 LRU 链表尾部
 //! - **刷新**: O(k) - k 为脏块数量
 //!
-//! 相比 lwext4 的红黑树实现，BTreeMap 在实践中通常有更好的缓存局部性。
+//! 相比手动实现的 BTreeMap，lru crate 提供更快的 O(1) 操作和自动的 LRU 管理。
 //!
 //! # 内存分配要求
 //!
@@ -96,5 +94,5 @@
 mod buffer;
 mod block_cache;
 
-pub use buffer::{BufferId, CacheBuffer, CacheFlags, EndWriteCallback};
+pub use buffer::{CacheBuffer, CacheFlags, EndWriteCallback};
 pub use block_cache::{BlockCache, CacheStats, DEFAULT_CACHE_SIZE};

@@ -149,7 +149,7 @@ pub use fs::{
 };
 
 // Cache
-pub use cache::{BlockCache, CacheBuffer, CacheFlags, CacheStats, BufferId, DEFAULT_CACHE_SIZE};
+pub use cache::{BlockCache, CacheBuffer, CacheFlags, CacheStats, DEFAULT_CACHE_SIZE};
 
 // Transaction
 pub use transaction::SimpleTransaction;

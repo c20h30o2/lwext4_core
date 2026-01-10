@@ -148,7 +148,7 @@ pub trait BlockDevice {
 /// ```
 ///
 /// 对应 lwext4 的 `ext4_block_dev_lock/unlock` API
-pub struct BlockDev<D> {
+pub struct BlockDev<D: BlockDevice> {
     /// 底层设备
     device: D,
     /// 分区偏移（字节）
@@ -724,5 +724,36 @@ impl<D: BlockDevice> BlockDev<D> {
     /// 如果引用计数大于 0，返回 true
     pub fn is_referenced(&self) -> bool {
         self.ref_count > 0
+    }
+}
+
+/// Drop实现：在BlockDev销毁时自动flush所有脏块
+///
+/// **重要**：这是防止数据丢失的关键机制。
+/// 当BlockDev超出作用域（文件系统unmount、程序退出等），
+/// 自动flush所有缓存中的脏块到磁盘。
+impl<D: BlockDevice> Drop for BlockDev<D> {
+    fn drop(&mut self) {
+        if let Some(cache) = &mut self.bcache {
+            let dirty_count = cache.stats().dirty_blocks;
+            if dirty_count > 0 {
+                log::warn!(
+                    "[BlockDev] Dropping with {} dirty blocks, flushing...",
+                    dirty_count
+                );
+
+                let sector_size = self.device.sector_size();
+                let partition_offset = self.partition_offset;
+
+                match cache.flush_all(&mut self.device, sector_size, partition_offset) {
+                    Ok(flushed) => {
+                        log::info!("[BlockDev] Drop: flushed {} dirty blocks", flushed);
+                    }
+                    Err(e) => {
+                        log::error!("[BlockDev] Drop: failed to flush cache: {:?}", e);
+                    }
+                }
+            }
+        }
     }
 }
