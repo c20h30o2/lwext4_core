@@ -380,12 +380,94 @@ impl<D: BlockDevice> BlockDev<D> {
     ///
     /// 如果块不在缓存中或写入失败，返回错误
     pub fn flush_lba(&mut self, lba: u64) -> Result<()> {
+        // 先获取必要参数，避免借用冲突
+        let sector_size = self.device.sector_size();
+        let partition_offset = self.partition_offset;
+        let block_size = self.block_size();
+
         if let Some(cache) = &mut self.bcache {
-            let sector_size = self.device.sector_size();
-            let partition_offset = self.partition_offset;
-            cache.flush_lba(lba, &mut self.device, sector_size, partition_offset)?;
+            // 使用新架构：Cache提供数据，BlockDev负责I/O
+            // 获取数据并复制到临时buffer
+            let data = if let Some(data) = cache.get_block_data(lba) {
+                data.to_vec()
+            } else {
+                return Ok(());
+            };
+
+            // 释放cache借用，进行I/O
+            drop(cache);
+
+            // 计算物理地址并写入
+            let pba = (lba * block_size as u64 + partition_offset) / sector_size as u64;
+            let count = (block_size as usize + sector_size as usize - 1) / sector_size as usize;
+            self.device_mut().write_blocks(pba, count as u32, &data)?;
+
+            // 重新借用cache并标记为clean
+            if let Some(cache) = &mut self.bcache {
+                cache.mark_clean(lba)?;
+            }
+
+            log::debug!("[BlockDev] Flushed single block LBA={:#x}", lba);
         }
         Ok(())
+    }
+
+    /// 部分flush：刷新指定数量的脏块（从LRU端开始）
+    ///
+    /// 这是主动flush机制的核心方法，用于防止cache被脏块填满。
+    /// 当cache接近满或脏块比例过高时调用。
+    ///
+    /// # 参数
+    ///
+    /// * `count` - 要flush的块数量，如果脏块数量不足则flush所有脏块
+    ///
+    /// # 返回
+    ///
+    /// 返回实际flush的块数量
+    pub fn flush_some_dirty_blocks(&mut self, count: usize) -> Result<usize> {
+        // 先获取必要参数，避免借用冲突
+        let sector_size = self.device.sector_size();
+        let partition_offset = self.partition_offset;
+        let block_size = self.block_size();
+
+        let to_flush = if let Some(cache) = &mut self.bcache {
+            let dirty_blocks = cache.get_dirty_blocks();
+            dirty_blocks.into_iter().take(count).collect::<alloc::vec::Vec<_>>()
+        } else {
+            return Ok(0);
+        };
+
+        let actual_count = to_flush.len();
+        if actual_count > 0 {
+            log::debug!("[BlockDev] Flushing {} dirty blocks (LRU)", actual_count);
+
+            for lba in to_flush {
+                // 每次循环重新借用cache
+                let data = if let Some(cache) = &self.bcache {
+                    if let Some(data) = cache.get_block_data(lba) {
+                        data.to_vec()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+
+                // 进行I/O（此时没有cache借用）
+                let pba = (lba * block_size as u64 + partition_offset) / sector_size as u64;
+                let count = (block_size as usize + sector_size as usize - 1) / sector_size as usize;
+                self.device_mut().write_blocks(pba, count as u32, &data)?;
+
+                // 标记clean
+                if let Some(cache) = &mut self.bcache {
+                    cache.mark_clean(lba)?;
+                }
+            }
+
+            log::debug!("[BlockDev] Flushed {} blocks successfully", actual_count);
+        }
+
+        Ok(actual_count)
     }
 
     // ===== 直接访问接口（绕过缓存）=====
@@ -732,22 +814,22 @@ impl<D: BlockDevice> BlockDev<D> {
 /// **重要**：这是防止数据丢失的关键机制。
 /// 当BlockDev超出作用域（文件系统unmount、程序退出等），
 /// 自动flush所有缓存中的脏块到磁盘。
+///
+/// 这个实现使用重构后的架构：BlockDev::flush()协调I/O操作
 impl<D: BlockDevice> Drop for BlockDev<D> {
     fn drop(&mut self) {
-        if let Some(cache) = &mut self.bcache {
-            let dirty_count = cache.stats().dirty_blocks;
+        if let Some(cache) = &self.bcache {
+            let dirty_count = cache.dirty_count();
             if dirty_count > 0 {
                 log::warn!(
                     "[BlockDev] Dropping with {} dirty blocks, flushing...",
                     dirty_count
                 );
 
-                let sector_size = self.device.sector_size();
-                let partition_offset = self.partition_offset;
-
-                match cache.flush_all(&mut self.device, sector_size, partition_offset) {
-                    Ok(flushed) => {
-                        log::info!("[BlockDev] Drop: flushed {} dirty blocks", flushed);
+                // 使用重构后的flush方法
+                match self.flush() {
+                    Ok(()) => {
+                        log::info!("[BlockDev] Drop: successfully flushed all dirty blocks");
                     }
                     Err(e) => {
                         log::error!("[BlockDev] Drop: failed to flush cache: {:?}", e);

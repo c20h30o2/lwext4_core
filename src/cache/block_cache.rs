@@ -509,6 +509,45 @@ impl BlockCache {
         self.dirty_set.len()
     }
 
+    /// 获取脏块比例 (0.0 - 1.0)
+    pub fn dirty_ratio(&self) -> f64 {
+        if self.cache.is_empty() {
+            0.0
+        } else {
+            self.dirty_set.len() as f64 / self.cache.len() as f64
+        }
+    }
+
+    /// 获取所有脏块的LBA列表
+    ///
+    /// 返回的列表按LRU顺序排列（最老的在前）
+    pub fn get_dirty_blocks(&self) -> alloc::vec::Vec<u64> {
+        // 获取LRU顺序的所有块
+        let lru_order: alloc::vec::Vec<u64> = self.cache.iter().map(|(k, _)| *k).collect();
+
+        // 过滤出脏块
+        lru_order.into_iter()
+            .filter(|lba| self.dirty_set.contains(lba))
+            .collect()
+    }
+
+    /// 获取块的数据（用于外部flush）
+    ///
+    /// 返回块数据的不可变引用，如果块不存在返回None
+    pub fn get_block_data(&self, lba: u64) -> Option<&[u8]> {
+        self.cache.peek(&lba).map(|buf| buf.data.as_slice())
+    }
+
+    /// 标记块为clean（flush完成后调用）
+    ///
+    /// 注意：这不会修改块的数据或uptodate标记
+    pub fn mark_clean(&mut self, lba: u64) -> Result<()> {
+        if self.dirty_set.remove(&lba) {
+            log::debug!("[CACHE] mark_clean LBA={:#x}, remaining_dirty={}", lba, self.dirty_set.len());
+        }
+        Ok(())
+    }
+
     /// 调整缓存大小
     ///
     /// 如果新容量小于当前块数，会驱逐LRU块

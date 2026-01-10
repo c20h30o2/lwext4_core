@@ -91,7 +91,23 @@ impl<'a, D: BlockDevice> Block<'a, D> {
 
         if let Some(cache) = &mut block_dev.bcache {
             // 有缓存：在缓存中分配块
-            let (_cache_buf, is_new) = cache.alloc(lba)?;
+            // 使用主动flush机制：如果alloc失败（NoSpace），先flush一些脏块再重试
+            let (_cache_buf, is_new) = match cache.alloc(lba) {
+                Ok(result) => result,
+                Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
+                    // Cache满且都是脏块 - 主动flush后重试
+                    let flush_count = cache.capacity() / 4;
+                    drop(cache); // 释放借用
+                    log::warn!("[Block::get] Cache full with dirty blocks, flushing {} blocks", flush_count);
+
+                    // Flush 25%的cache容量
+                    block_dev.flush_some_dirty_blocks(flush_count)?;
+
+                    // 重试alloc
+                    block_dev.bcache.as_mut().unwrap().alloc(lba)?
+                }
+                Err(e) => return Err(e),
+            };
 
             if is_new {
                 // 新分配的块，需要从磁盘读取
@@ -162,7 +178,18 @@ impl<'a, D: BlockDevice> Block<'a, D> {
 
         if let Some(cache) = &mut block_dev.bcache {
             // 有缓存：在缓存中分配块，但不读取磁盘
-            let (cache_buf, _is_new) = cache.alloc(lba)?;
+            // 使用主动flush机制
+            let (cache_buf, _is_new) = match cache.alloc(lba) {
+                Ok(result) => result,
+                Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
+                    let flush_count = cache.capacity() / 4;
+                    drop(cache); // 释放借用
+                    log::warn!("[Block::get_noread] Cache full, flushing {} blocks", flush_count);
+                    block_dev.flush_some_dirty_blocks(flush_count)?;
+                    block_dev.bcache.as_mut().unwrap().alloc(lba)?
+                }
+                Err(e) => return Err(e),
+            };
 
             // 不管是新块还是已存在，都标记为 uptodate
             // 因为调用者会立即覆盖整个块
@@ -211,7 +238,18 @@ impl<'a, D: BlockDevice> Block<'a, D> {
     {
         if let Some(cache) = &mut self.block_dev.bcache {
             // 有缓存：临时获取缓存块引用
-            let (cache_buf, _) = cache.alloc(self.lba)?;
+            // 使用主动flush机制
+            let (cache_buf, _) = match cache.alloc(self.lba) {
+                Ok(result) => result,
+                Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
+                    let flush_count = cache.capacity() / 4;
+                    drop(cache); // 释放借用
+                    log::warn!("[Block::with_data] Cache full, flushing {} blocks", flush_count);
+                    self.block_dev.flush_some_dirty_blocks(flush_count)?;
+                    self.block_dev.bcache.as_mut().unwrap().alloc(self.lba)?
+                }
+                Err(e) => return Err(e),
+            };
             let result = f(&cache_buf.data);
             // ✅ lru crate 自动管理生命周期，无需手动 free
             Ok(result)
@@ -241,12 +279,25 @@ impl<'a, D: BlockDevice> Block<'a, D> {
     {
         if let Some(cache) = &mut self.block_dev.bcache {
             // 有缓存：临时获取缓存块可变引用
-            let (cache_buf, _) = cache.alloc(self.lba)?;
+            // 使用主动flush机制
+            let (cache_buf, _) = match cache.alloc(self.lba) {
+                Ok(result) => result,
+                Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
+                    let flush_count = cache.capacity() / 4;
+                    drop(cache); // 释放借用
+                    log::warn!("[Block::with_data_mut] Cache full, flushing {} blocks", flush_count);
+                    self.block_dev.flush_some_dirty_blocks(flush_count)?;
+                    self.block_dev.bcache.as_mut().unwrap().alloc(self.lba)?
+                }
+                Err(e) => return Err(e),
+            };
             let result = f(&mut cache_buf.data);
             // 标记为脏
             cache_buf.mark_dirty();
-            // 将块加入脏列表
-            cache.mark_dirty(self.lba)?;
+            // 将块加入脏列表（需要重新借用cache，因为可能经过了drop）
+            if let Some(cache) = &mut self.block_dev.bcache {
+                cache.mark_dirty(self.lba)?;
+            }
             // ✅ lru crate 自动管理生命周期，无需手动 free
             // 脏块会在 dirty_set 中跟踪，flush 时会写回磁盘
             Ok(result)

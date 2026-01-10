@@ -53,7 +53,21 @@ impl<D: BlockDevice> BlockDev<D> {
 
             // 将数据填充到缓存
             if let Some(cache) = &mut self.bcache {
-                let (cache_buf, _is_new) = cache.alloc(lba)?;
+                // 使用主动flush机制
+                let result = cache.alloc(lba);
+                let (cache_buf, _is_new) = match result {
+                    Ok(result) => result,
+                    Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
+                        // 先获取capacity，然后释放借用
+                        let flush_count = cache.capacity() / 4;
+                        drop(cache); // 显式释放借用
+                        log::warn!("[read_block] Cache full, flushing {} blocks", flush_count);
+                        self.flush_some_dirty_blocks(flush_count)?;
+                        // 重新借用并重试
+                        self.bcache.as_mut().unwrap().alloc(lba)?
+                    }
+                    Err(e) => return Err(e),
+                };
                 cache_buf.data.copy_from_slice(&buf[..block_size as usize]);
                 cache_buf.mark_uptodate();
                 // ✅ lru crate 自动管理生命周期，无需手动 free
@@ -103,13 +117,29 @@ impl<D: BlockDevice> BlockDev<D> {
                 }
                 Err(_) => {
                     // 块不在缓存中 - 分配新块并写入
-                    let (cache_buf, _is_new) = cache.alloc(lba)?;
+                    // 使用主动flush机制
+                    let result = cache.alloc(lba);
+                    let (cache_buf, _is_new) = match result {
+                        Ok(result) => result,
+                        Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
+                            let flush_count = cache.capacity() / 4;
+                            drop(cache); // 显式释放借用
+                            log::warn!("[write_block] Cache full, flushing {} blocks", flush_count);
+                            self.flush_some_dirty_blocks(flush_count)?;
+                            // 重新获取cache并分配
+                            let cache = self.bcache.as_mut().unwrap();
+                            cache.alloc(lba)?
+                        }
+                        Err(e) => return Err(e),
+                    };
                     cache_buf.data[..buf.len()].copy_from_slice(buf);
                     cache_buf.mark_uptodate();
                     cache_buf.mark_dirty();
 
-                    // 将块加入脏列表
-                    cache.mark_dirty(lba)?;
+                    // 将块加入脏列表（需要重新借用cache，因为可能经过了drop）
+                    if let Some(cache) = &mut self.bcache {
+                        cache.mark_dirty(lba)?;
+                    }
 
                     // ✅ lru crate 自动管理生命周期，无需手动 free
 
@@ -230,17 +260,54 @@ impl<D: BlockDevice> BlockDev<D> {
     ///
     /// 如果启用了缓存，先刷新所有脏块到设备，然后调用设备的 flush。
     /// 这是两层刷新：缓存层和硬件层。
+    /// 刷新所有缓存的脏块到磁盘
+    ///
+    /// 这是架构重构后的新实现：
+    /// - BlockCache提供脏块列表和数据
+    /// - BlockDev负责实际的I/O操作
+    /// - 职责清晰，无借用冲突
     pub fn flush(&mut self) -> Result<()> {
         // 第一层：刷新缓存中的脏块
+        // 先获取必要的参数（避免借用冲突）
         let sector_size = self.device().sector_size();
         let partition_offset = self.partition_offset();
+        let block_size = self.block_size();
 
-        // 临时取出缓存以避免借用冲突
-        if let Some(mut cache) = self.bcache.take() {
-            let result = cache.flush_all(self.device_mut(), sector_size, partition_offset);
-            // 恢复缓存
-            self.bcache = Some(cache);
-            result?;
+        let dirty_blocks = if let Some(cache) = &mut self.bcache {
+            cache.get_dirty_blocks()
+        } else {
+            alloc::vec::Vec::new()
+        };
+
+        let dirty_count = dirty_blocks.len();
+        if dirty_count > 0 {
+            log::debug!("[BlockDev] Flushing {} dirty blocks", dirty_count);
+
+            // 逐个flush脏块
+            for lba in dirty_blocks {
+                // 每次循环重新借用cache
+                let data = if let Some(cache) = &self.bcache {
+                    if let Some(data) = cache.get_block_data(lba) {
+                        data.to_vec()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+
+                // 进行I/O操作（此时没有cache借用）
+                let pba = (lba * block_size as u64 + partition_offset) / sector_size as u64;
+                let count = (block_size as usize + sector_size as usize - 1) / sector_size as usize;
+                self.device_mut().write_blocks(pba, count as u32, &data)?;
+
+                // 标记为clean
+                if let Some(cache) = &mut self.bcache {
+                    cache.mark_clean(lba)?;
+                }
+            }
+
+            log::debug!("[BlockDev] Flushed {} blocks successfully", dirty_count);
         }
 
         // 第二层：调用设备的硬件刷新（如 fsync）
