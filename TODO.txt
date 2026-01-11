@@ -1,6 +1,9 @@
 1.尝试使用现有的 lru crate 替换当前的block cache lru的简单实现， 并且进一步验证启用cache时的一致性与可靠性
 2.删除capi等不打算继续实现的模块
-更多代办：cache修复与优化 常用文件命令自动化全面测试脚本 日志功能整合 复杂功能支持 高级功能支持 性能优化
+更多代办：cache修复与优化（完成） 常用文件命令自动化全面测试脚本 文件时间问题（touch mkdir创建的项目时间都是1970开始，而echo创建日期正确，但时间不精准，原starryos也有这个问题） 文件截断实现（完成） 连续块分配实现 日志功能整合 crc校验整合 复杂功能支持（extent递归分裂、深度增长，这些功能未实现，导致add gcc失败） 高级功能支持 性能优化（add vim总是在89%停留很长时间、分配与回收的高级优化）彻底移除lwext4_rust以减少编译时间
+starryos层面：添加setfxattr以及更多文件系统相关系统调用支持
+注意仍然可能存在的rename导致泄漏的问题
+
 启用cache后：
 starry:~# apk add vim
 [  5.545231 0:10 starry_api::syscall::fs::fd_ops:138] [OPEN] openat FAILED: path=/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
@@ -29,3 +32,8 @@ v3.22.2-325-gffb20bd62d9 [https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/comm
 2 unavailable, 0 stale; 20185 distinct packages available
 
 现在则正常输出OK
+
+
+
+part1 以原starryos举例， 他没有实现xattr相关的系统调用， 如果要支持xattr却远远不止添加系统调用这么简单， 需要在lwext4检索相关的接口， 在lwext4_rust中利用ffi为这些c语言编写的接口做一层适配， 在arceos的ext4层为inode添加相关调用， 在vfs层添加调用， 最后处理系统调用
+另外，在后续测试中发现，在syscall层他的跨文件夹rename实现存在问题 

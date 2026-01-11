@@ -769,58 +769,167 @@ impl<D: BlockDevice> Ext4FileSystem<D> {
     pub fn truncate_file(&mut self, inode_num: u32, new_size: u64) -> Result<()> {
         use crate::extent::remove_space;
 
-        // FIXME: truncate 也会立即释放数据块，违反 POSIX 语义！
-        // 临时禁用truncate：既不更新 i_size，也不释放数据块
-        // 否则会导致 i_size 和 extent 树不一致！
+        // 先获取block_size，避免借用冲突
+        let block_size = self.sb.block_size() as u64;
 
         let mut inode_ref = InodeRef::get(&mut self.bdev, &mut self.sb, inode_num)?;
         let old_size = inode_ref.size()?;
 
+        // 大小相同，无需操作
         if old_size == new_size {
             return Ok(());
         }
 
-        if old_size < new_size {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "Cannot enlarge file with truncate (use write operations instead)",
-            ));
-        }
-
-        log::warn!(
-            "[TRUNCATE] inode {} truncate {} -> {} COMPLETELY DISABLED - deferred deletion not implemented (WILL LEAK SPACE + INCONSISTENT SIZE)",
+        log::debug!(
+            "[TRUNCATE] inode {} truncate: {} -> {} bytes",
             inode_num, old_size, new_size
         );
 
-        // 临时完全禁用 truncate：既不修改 i_size，也不释放数据块
-        // 保持 i_size 和 extent 树一致
-        return Ok(());
+        if old_size < new_size {
+            // ===== 情况 1: 扩展文件 =====
+            // ext4 支持稀疏文件，所以我们只需要更新 i_size
+            // 新增的区域会被视为"hole"（空洞），读取时返回 0
+            // 不需要实际分配块或写入数据
 
-        // 第二步：释放不再需要的数据块
-        // 计算需要释放的逻辑块范围
-        let block_size = self.sb.block_size() as u64;
-        let first_block_to_remove = ((new_size + block_size - 1) / block_size) as u32;
-        let last_block_to_remove = ((old_size + block_size - 1) / block_size) as u32;
+            log::debug!(
+                "[TRUNCATE] Expanding file (sparse): {} -> {} bytes",
+                old_size, new_size
+            );
 
-        if first_block_to_remove < last_block_to_remove {
-            // 调用 remove_space 释放块
-            // remove_space 的参数是 [from, to)，即删除 [from, to-1] 的块
-            {
+            inode_ref.set_size(new_size)?;
+            inode_ref.mark_dirty()?;
+
+        } else {
+            // ===== 情况 2: 缩小文件 =====
+            // 需要：
+            // 1. 更新 i_size
+            // 2. 清零部分块（如果需要）
+            // 3. 释放不再需要的数据块
+
+            log::debug!(
+                "[TRUNCATE] Shrinking file: {} -> {} bytes",
+                old_size, new_size
+            );
+
+            // 步骤 1: 更新 i_size
+            inode_ref.set_size(new_size)?;
+            inode_ref.mark_dirty()?;
+            drop(inode_ref); // 立即释放，后续操作会重新获取
+
+            // 步骤 2: 如果新大小不是块对齐的，需要清零部分块
+            // 这是关键！确保被截断的数据不会在重新扩展时"复活"
+            let offset_in_block = (new_size % block_size) as usize;
+            if new_size > 0 && offset_in_block != 0 {
+                // 新结尾在块内部，需要清零该块的剩余部分
+                let last_block_num = ((new_size - 1) / block_size) as u32;
+
+                log::debug!(
+                    "[TRUNCATE] Zeroing partial block {}: offset {} to {}",
+                    last_block_num,
+                    offset_in_block,
+                    block_size
+                );
+
+                // 重新获取 inode_ref 用于查找物理块
                 let mut inode_ref = InodeRef::get(&mut self.bdev, &mut self.sb, inode_num)?;
 
-                // 注意：remove_space API 需要重构，因为它同时要求 inode_ref 和 sb
-                // 但 inode_ref 已经持有 &mut sb。这里使用 unsafe 来绕过借用检查
-                //
-                // 安全性说明：
-                // - inode_ref.sb 指向 self.sb
-                // - 我们只在 inode_ref 的生命周期内使用这个引用
-                // - remove_space 不会同时修改同一个字段
+                // 使用 get_blocks 查找逻辑块对应的物理块（不分配新块）
+                use crate::extent::get_blocks;
+                use crate::balloc::BlockAllocator;
+
+                // get_blocks 需要 &mut Superblock，但 inode_ref 已经借用了 sb
+                // 使用 unsafe 获取另一个引用（与 remove_space 相同的模式）
                 let sb_ptr = inode_ref.superblock_mut() as *mut crate::superblock::Superblock;
                 let sb_ref = unsafe { &mut *sb_ptr };
 
-                remove_space(&mut inode_ref, sb_ref, first_block_to_remove, last_block_to_remove)?;
+                let mut allocator = BlockAllocator::new();
+                let (physical_block, _count) = get_blocks(
+                    &mut inode_ref,
+                    sb_ref,
+                    &mut allocator,
+                    last_block_num,
+                    1,
+                    false, // 不分配新块，只查找
+                )?;
+
+                // 释放 inode_ref 以便访问 self.bdev
+                drop(inode_ref);
+
+                if physical_block != 0 {
+                    // 该块存在，读取并清零部分数据后写回
+
+                    // 读取物理块
+                    let mut block_buf = alloc::vec![0u8; block_size as usize];
+                    self.bdev.read_block(physical_block, &mut block_buf)?;
+
+                    // 清零从 offset_in_block 到块末尾的部分
+                    block_buf[offset_in_block..].fill(0);
+
+                    // 写回物理块
+                    self.bdev.write_block(physical_block, &block_buf)?;
+
+                    log::debug!(
+                        "[TRUNCATE] Zeroed bytes [{}, {}) in block {} (physical block {})",
+                        offset_in_block,
+                        block_size,
+                        last_block_num,
+                        physical_block
+                    );
+                } else {
+                    // 该块不存在（稀疏文件的hole），无需清零
+                    log::debug!(
+                        "[TRUNCATE] Block {} is a hole, no need to zero",
+                        last_block_num
+                    );
+                }
             }
-            // inode_ref 在这里 drop，自动写回修改
+
+            // 步骤 3: 计算需要释放的逻辑块范围
+            // first_block_to_keep: 新大小需要的最后一个块的下一个块
+            // last_block_to_remove: 旧大小占用的最后一个块（包含）
+            let first_block_to_remove = if new_size == 0 {
+                0
+            } else {
+                ((new_size + block_size - 1) / block_size) as u32
+            };
+
+            let last_block_to_remove = if old_size == 0 {
+                0
+            } else {
+                ((old_size - 1) / block_size) as u32 // 包含最后一个字节的块号
+            };
+
+            // 步骤 4: 如果有需要释放的块，调用 remove_space
+            if first_block_to_remove <= last_block_to_remove {
+                log::debug!(
+                    "[TRUNCATE] Freeing blocks: [{}, {}]",
+                    first_block_to_remove, last_block_to_remove
+                );
+
+                // 重新获取 inode_ref 用于 remove_space
+                let mut inode_ref = InodeRef::get(&mut self.bdev, &mut self.sb, inode_num)?;
+
+                // remove_space 需要 &mut Superblock，但 inode_ref 已经借用了 sb
+                // 这里使用 unsafe 获取 sb 的另一个可变引用
+                //
+                // 安全性保证：
+                // - inode_ref.sb 和 sb_ref 指向同一个对象
+                // - remove_space 和 inode_ref 操作的 sb 字段不冲突
+                // - 在 inode_ref 的生命周期内使用 sb_ref
+                let sb_ptr = inode_ref.superblock_mut() as *mut crate::superblock::Superblock;
+                let sb_ref = unsafe { &mut *sb_ptr };
+
+                // 调用 remove_space 释放块
+                // 注意：remove_space 的 to 参数是包含的（不是左闭右开）
+                remove_space(&mut inode_ref, sb_ref, first_block_to_remove, last_block_to_remove)?;
+
+                log::debug!(
+                    "[TRUNCATE] Successfully freed {} blocks",
+                    last_block_to_remove - first_block_to_remove + 1
+                );
+            } else {
+                log::debug!("[TRUNCATE] No blocks to free");
+            }
         }
 
         Ok(())
