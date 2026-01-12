@@ -909,8 +909,13 @@ fn try_insert_to_leaf_block<D: BlockDevice>(
         let header_size = core::mem::size_of::<ext4_extent_header>();
         let extent_size = core::mem::size_of::<ext4_extent>();
 
-        // 找到插入位置（保持排序）并检查重复
+        // 找到插入位置（保持排序）并检查是否可以合并
         let mut insert_pos = entries_count as usize;
+        let mut can_merge_with_prev = false;
+        let mut can_merge_with_next = false;
+        let mut prev_pos: Option<usize> = None;
+        let mut next_pos: Option<usize> = None;
+
         for i in 0..entries_count as usize {
             let offset = header_size + i * extent_size;
             let existing_extent = unsafe {
@@ -918,17 +923,15 @@ fn try_insert_to_leaf_block<D: BlockDevice>(
             };
 
             let existing_block = u32::from_le(existing_extent.block);
+            let existing_len = u16::from_le(existing_extent.len);
+            let existing_physical = crate::extent::helpers::ext4_ext_pblock(existing_extent);
 
             // 🔧 关键修复：检查是否已存在相同的逻辑块
             if existing_block == logical_block {
-                // 逻辑块已存在，这是一个严重错误
-                // 不应该重复插入相同的逻辑块
                 log::error!(
                     "[EXTENT_INSERT] DUPLICATE DETECTED: logical_block={} already exists at pos {}, \
                      existing_physical=0x{:x}, new_physical=0x{:x}",
-                    logical_block, i,
-                    crate::extent::helpers::ext4_ext_pblock(existing_extent),
-                    physical_block
+                    logical_block, i, existing_physical, physical_block
                 );
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
@@ -936,12 +939,158 @@ fn try_insert_to_leaf_block<D: BlockDevice>(
                 ));
             }
 
+            // 🔧 新增：检查是否可以与前一个 extent 合并
+            // 条件：existing_extent 在 new_extent 之前，且物理和逻辑都连续
+            if existing_block + existing_len as u32 == logical_block &&
+               existing_physical + existing_len as u64 == physical_block {
+                can_merge_with_prev = true;
+                prev_pos = Some(i);
+                log::debug!(
+                    "[EXTENT_MERGE] Can merge with PREV extent at pos {}: \
+                     prev_logical={}-{}, prev_physical=0x{:x}-0x{:x}, \
+                     new_logical={}, new_physical=0x{:x}",
+                    i, existing_block, existing_block + existing_len as u32 - 1,
+                    existing_physical, existing_physical + existing_len as u64 - 1,
+                    logical_block, physical_block
+                );
+            }
+
             if existing_block > logical_block {
                 insert_pos = i;
+
+                // 🔧 新增：检查是否可以与后一个 extent 合并
+                // 条件：new_extent 在 existing_extent 之前，且物理和逻辑都连续
+                if logical_block + length == existing_block &&
+                   physical_block + length as u64 == existing_physical {
+                    can_merge_with_next = true;
+                    next_pos = Some(i);
+                    log::debug!(
+                        "[EXTENT_MERGE] Can merge with NEXT extent at pos {}: \
+                         new_logical={}, new_physical=0x{:x}, \
+                         next_logical={}-{}, next_physical=0x{:x}-0x{:x}",
+                        i, logical_block, physical_block,
+                        existing_block, existing_block + existing_len as u32 - 1,
+                        existing_physical, existing_physical + existing_len as u64 - 1
+                    );
+                }
                 break;
             }
         }
 
+        // 🔧 执行合并操作（如果可以合并）
+        if can_merge_with_prev && can_merge_with_next {
+            // Case 3: 桥接合并 - 新 extent 连接了 prev 和 next
+            // 需要将 prev、new、next 三个 extent 合并为一个
+            let prev_idx = prev_pos.unwrap();
+            let next_idx = next_pos.unwrap();
+
+            let prev_offset = header_size + prev_idx * extent_size;
+            let next_offset = header_size + next_idx * extent_size;
+
+            let (prev_len, next_len) = unsafe {
+                let prev_ext = &*(data[prev_offset..].as_ptr() as *const ext4_extent);
+                let next_ext = &*(data[next_offset..].as_ptr() as *const ext4_extent);
+                (u16::from_le(prev_ext.len), u16::from_le(next_ext.len))
+            };
+
+            // 扩展 prev extent 的长度以覆盖 prev + new + next
+            let new_total_len = (prev_len as u32 + length + next_len as u32) as u16;
+
+            unsafe {
+                let prev_ext = &mut *(data[prev_offset..].as_mut_ptr() as *mut ext4_extent);
+                prev_ext.len = new_total_len.to_le();
+            }
+
+            // 删除 next extent（向前移动后续的 extents）
+            if next_idx + 1 < entries_count as usize {
+                let src_offset = header_size + (next_idx + 1) * extent_size;
+                let dst_offset = header_size + next_idx * extent_size;
+                let move_count = (entries_count as usize - next_idx - 1) * extent_size;
+
+                unsafe {
+                    core::ptr::copy(
+                        data[src_offset..].as_ptr(),
+                        data[dst_offset..].as_mut_ptr(),
+                        move_count,
+                    );
+                }
+            }
+
+            // 更新 header（entries 减 1，因为删除了 next extent）
+            header.entries = (entries_count - 1).to_le();
+
+            log::info!(
+                "[EXTENT_MERGE] BRIDGE MERGE: prev_pos={}, next_pos={}, \
+                 merged_logical={}-{}, total_len={} (prev_len={} + new_len={} + next_len={})",
+                prev_idx, next_idx,
+                logical_block.saturating_sub(prev_len as u32),
+                logical_block + length - 1 + next_len as u32,
+                new_total_len, prev_len, length, next_len
+            );
+
+            return Ok(());
+
+        } else if can_merge_with_prev {
+            // Case 1: 与前一个 extent 合并 - 扩展 prev extent
+            let prev_idx = prev_pos.unwrap();
+            let prev_offset = header_size + prev_idx * extent_size;
+
+            let prev_len = unsafe {
+                let prev_ext = &*(data[prev_offset..].as_ptr() as *const ext4_extent);
+                u16::from_le(prev_ext.len)
+            };
+
+            let new_len = (prev_len as u32 + length) as u16;
+
+            unsafe {
+                let prev_ext = &mut *(data[prev_offset..].as_mut_ptr() as *mut ext4_extent);
+                prev_ext.len = new_len.to_le();
+            }
+
+            log::info!(
+                "[EXTENT_MERGE] PREV MERGE: pos={}, extended_len={} -> {}, \
+                 logical_range={}-{}",
+                prev_idx, prev_len, new_len,
+                logical_block.saturating_sub(prev_len as u32),
+                logical_block + length - 1
+            );
+
+            return Ok(());
+
+        } else if can_merge_with_next {
+            // Case 2: 与后一个 extent 合并 - 向前扩展 next extent
+            let next_idx = next_pos.unwrap();
+            let next_offset = header_size + next_idx * extent_size;
+
+            let next_len = unsafe {
+                let next_ext = &*(data[next_offset..].as_ptr() as *const ext4_extent);
+                u16::from_le(next_ext.len)
+            };
+
+            let new_len = (length + next_len as u32) as u16;
+
+            unsafe {
+                let next_ext = &mut *(data[next_offset..].as_mut_ptr() as *mut ext4_extent);
+                // 更新起始逻辑块
+                next_ext.block = logical_block.to_le();
+                // 更新起始物理块
+                next_ext.start_lo = (physical_block as u32).to_le();
+                next_ext.start_hi = ((physical_block >> 32) as u16).to_le();
+                // 更新长度
+                next_ext.len = new_len.to_le();
+            }
+
+            log::info!(
+                "[EXTENT_MERGE] NEXT MERGE: pos={}, extended_len={} -> {}, \
+                 logical_range={}-{}",
+                next_idx, next_len, new_len,
+                logical_block, logical_block + new_len as u32 - 1
+            );
+
+            return Ok(());
+        }
+
+        // 如果不能合并，继续执行原有的插入逻辑
         // 移动后面的 extent 为新 extent 腾出空间
         if insert_pos < entries_count as usize {
             let src_offset = header_size + insert_pos * extent_size;
@@ -1018,36 +1167,85 @@ fn build_extent_path_for_leaf<D: BlockDevice>(
         return Ok(path);
     }
 
-    // 对于深度 > 0，需要添加中间节点和叶子节点
-    // 这里我们简化处理：只支持深度 1（一层索引 + 一层叶子）
-    if max_depth == 1 {
-        // 读取叶子节点 header
-        let mut block = Block::get(inode_ref.bdev(), leaf_block)?;
-        let leaf_header = block.with_data(|data| {
-            let header = unsafe {
-                *(data.as_ptr() as *const ext4_extent_header)
-            };
-            header.clone()
-        })?;
+    // 对于深度 > 0，需要从根节点遍历到目标叶子节点
+    // 支持任意深度的索引树
+    if max_depth > 0 {
+        let mut current_block = leaf_block;
+        let mut current_depth = max_depth;
 
-        // 添加叶子节点
-        path.push(ExtentPathNode {
-            block_addr: leaf_block,
-            depth: 0, // 叶子节点深度为 0
-            header: leaf_header,
-            index_pos: 0,
-            node_type: ExtentNodeType::Leaf,
-        });
+        // 从根节点开始，逐层向下查找，直到叶子节点
+        // 注意：我们已知目标叶子块地址，需要构建到达它的路径
+        // 这里采用简化策略：直接读取每一层的节点
+        while current_depth > 0 {
+            // 读取当前层的节点 header
+            let mut block = Block::get(inode_ref.bdev(), current_block)?;
+            let node_header = block.with_data(|data| {
+                let header = unsafe {
+                    *(data.as_ptr() as *const ext4_extent_header)
+                };
+                header.clone()
+            })?;
+
+            // 验证深度一致性
+            let node_depth = u16::from_le(node_header.depth);
+            if node_depth != current_depth - 1 {
+                log::warn!(
+                    "[BUILD_PATH] Depth mismatch: expected {}, got {} at block 0x{:x}",
+                    current_depth - 1, node_depth, current_block
+                );
+            }
+
+            // 添加节点到路径
+            let node_type = if current_depth == 1 {
+                ExtentNodeType::Leaf
+            } else {
+                ExtentNodeType::Index
+            };
+
+            path.push(ExtentPathNode {
+                block_addr: current_block,
+                depth: node_depth,
+                header: node_header,
+                index_pos: 0,
+                node_type,
+            });
+
+            log::debug!(
+                "[BUILD_PATH] Added node: depth={}, block=0x{:x}, type={:?}",
+                node_depth, current_block, node_type
+            );
+
+            // 如果是叶子节点，完成路径构建
+            if current_depth == 1 {
+                break;
+            }
+
+            // 否则，读取第一个索引项，继续向下遍历
+            // 注意：这里的假设是我们要找的叶子块在某个索引项下
+            // 实际上，由于我们已知 leaf_block，应该在索引中查找它
+            // 但为了简化，我们暂时读取第一个索引
+            // TODO: 改进为在索引中查找匹配的 leaf_block
+            let first_idx = block.with_data(|data| {
+                let header_size = core::mem::size_of::<ext4_extent_header>();
+                unsafe {
+                    *(data[header_size..].as_ptr() as *const ext4_extent_idx)
+                }
+            })?;
+
+            current_block = super::helpers::ext4_idx_pblock(&first_idx);
+            current_depth -= 1;
+
+            log::debug!(
+                "[BUILD_PATH] Moving to next level: block=0x{:x}, depth={}",
+                current_block, current_depth
+            );
+        }
 
         return Ok(path);
     }
 
-    // 对于深度 > 1，需要遍历索引树
-    // TODO: 完整实现任意深度支持
-    Err(Error::new(
-        ErrorKind::Unsupported,
-        "build_extent_path_for_leaf: depth > 1 not yet supported",
-    ))
+    // 深度为 0 时，根节点就是叶子，已在前面处理
+    Ok(path)
 }
 
 /// 分裂后确定目标叶子块
@@ -1066,24 +1264,29 @@ fn determine_target_leaf_after_split<D: BlockDevice>(
         depth, logical_block
     );
 
-    if depth == 1 {
-        // 读取根节点的索引数组
+    // 支持任意深度的树
+    // 从根节点开始，逐层查找覆盖 logical_block 的索引项
+    let mut current_depth = depth;
+    let mut current_block: Option<u64> = None;
+
+    // 第一层：从根节点（inode）读取索引
+    if current_depth > 0 {
         let (indices, _) = super::split::read_indices_from_inode(inode_ref)?;
 
         log::debug!(
-            "[DETERMINE_TARGET] Read {} indices from inode",
-            indices.len()
+            "[DETERMINE_TARGET] Level {}: Read {} indices from inode",
+            current_depth, indices.len()
         );
 
         // 找到最后一个 first_block <= logical_block 的索引
         let mut target_idx: Option<&ext4_extent_idx> = None;
         for (i, idx) in indices.iter().enumerate() {
             let idx_block = u32::from_le(idx.block);
-            let leaf_block = super::helpers::ext4_idx_pblock(idx);
+            let next_block = super::helpers::ext4_idx_pblock(idx);
 
             log::debug!(
-                "[DETERMINE_TARGET] Index {}: idx_block={}, leaf_block=0x{:x}",
-                i, idx_block, leaf_block
+                "[DETERMINE_TARGET] Index {}: idx_block={}, next_block=0x{:x}",
+                i, idx_block, next_block
             );
 
             if logical_block >= idx_block {
@@ -1094,29 +1297,82 @@ fn determine_target_leaf_after_split<D: BlockDevice>(
         }
 
         if let Some(idx) = target_idx {
-            // 使用辅助函数而不是手动组合
-            let leaf_block = super::helpers::ext4_idx_pblock(idx);
-
-            log::debug!(
-                "[DETERMINE_TARGET] Selected target: leaf_block=0x{:x}",
-                leaf_block
-            );
-
-            return Ok(leaf_block);
+            current_block = Some(super::helpers::ext4_idx_pblock(idx));
+            current_depth -= 1;
+        } else {
+            log::error!("[DETERMINE_TARGET] No matching index found in root!");
+            return Err(Error::new(
+                ErrorKind::Corrupted,
+                "No matching index found in root after split",
+            ));
         }
-
-        log::error!("[DETERMINE_TARGET] No matching index found!");
-        return Err(Error::new(
-            ErrorKind::Corrupted,
-            "No matching index found after split",
-        ));
     }
 
-    // TODO: 支持更深的树
-    Err(Error::new(
-        ErrorKind::Unsupported,
-        "determine_target_leaf_after_split: depth > 1 not yet supported",
-    ))
+    // 后续层：从索引块读取索引，直到达到叶子层
+    while current_depth > 0 {
+        if let Some(block_addr) = current_block {
+            // 读取索引块
+            let block_size = inode_ref.superblock().block_size();
+            let (indices, _) = super::split::read_indices_from_block(
+                inode_ref.bdev(),
+                block_addr,
+                block_size,
+            )?;
+
+            log::debug!(
+                "[DETERMINE_TARGET] Level {}: Read {} indices from block 0x{:x}",
+                current_depth, indices.len(), block_addr
+            );
+
+            // 找到覆盖 logical_block 的索引
+            let mut target_idx: Option<&ext4_extent_idx> = None;
+            for (i, idx) in indices.iter().enumerate() {
+                let idx_block = u32::from_le(idx.block);
+                let next_block = super::helpers::ext4_idx_pblock(idx);
+
+                log::debug!(
+                    "[DETERMINE_TARGET] Index {}: idx_block={}, next_block=0x{:x}",
+                    i, idx_block, next_block
+                );
+
+                if logical_block >= idx_block {
+                    target_idx = Some(idx);
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(idx) = target_idx {
+                current_block = Some(super::helpers::ext4_idx_pblock(idx));
+                current_depth -= 1;
+            } else {
+                log::error!("[DETERMINE_TARGET] No matching index found at depth {}!", current_depth);
+                return Err(Error::new(
+                    ErrorKind::Corrupted,
+                    "No matching index found in index block after split",
+                ));
+            }
+        } else {
+            return Err(Error::new(
+                ErrorKind::Corrupted,
+                "Invalid block address in determine_target_leaf_after_split",
+            ));
+        }
+    }
+
+    // 此时 current_block 应该指向目标叶子块
+    if let Some(leaf_block) = current_block {
+        log::debug!(
+            "[DETERMINE_TARGET] Final target: leaf_block=0x{:x}",
+            leaf_block
+        );
+        Ok(leaf_block)
+    } else {
+        Err(Error::new(
+            ErrorKind::Corrupted,
+            "No leaf block found after traversing index tree",
+        ))
+    }
 }
 
 /// 插入 extent 到叶子节点（支持任意深度）

@@ -590,7 +590,7 @@ pub(super) fn read_indices_from_inode<D: BlockDevice>(
 }
 
 /// 从块读取 index 数组
-fn read_indices_from_block<D: BlockDevice>(
+pub(super) fn read_indices_from_block<D: BlockDevice>(
     bdev: &mut crate::block::BlockDev<D>,
     block_addr: u64,
     _block_size: u32,

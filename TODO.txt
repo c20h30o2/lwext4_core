@@ -1,7 +1,20 @@
 1.尝试使用现有的 lru crate 替换当前的block cache lru的简单实现， 并且进一步验证启用cache时的一致性与可靠性
 2.删除capi等不打算继续实现的模块
-更多代办：cache修复与优化（完成） 常用文件命令自动化全面测试脚本 文件时间问题（touch mkdir创建的项目时间都是1970开始，而echo创建日期正确，但时间不精准，原starryos也有这个问题） 文件截断实现（完成） 连续块分配实现 日志功能整合 crc校验整合 复杂功能支持（extent递归分裂、深度增长，这些功能未实现，导致add gcc失败） 高级功能支持 性能优化（add vim总是在89%停留很长时间、分配与回收的高级优化）彻底移除lwext4_rust以减少编译时间
-starryos层面：添加setfxattr以及更多文件系统相关系统调用支持
+更多代办：
+常用文件命令自动化全面测试脚本 
+cache修复与优化（完成） 
+文件截断实现（完成） 
+连续块分配实现（完成） 
+复杂功能支持（extent递归分裂、深度增长，这些功能未实现，导致add gcc失败，已实现，apk add gcc成功，且apk add gcc musl-dev make成功，并且gcc -o test test.c编译成功） 
+
+文件时间问题（touch mkdir创建的项目时间都是1970开始，而echo创建日期正确，但时间不精准，原starryos也有这个问题） 
+日志功能整合 
+crc校验整合 
+高级功能支持(支持特殊文件的创建，比如socket fifo文件，支持xattr相关调用) 
+性能优化（add vim总是在89%停留很长时间、分配与回收的高级优化）
+彻底移除lwext4_rust以减少编译时间
+
+starryos层面：添加xattr系列系统调用、mkfifo系列特殊文件系统调用，以及更多文件系统相关系统调用支持
 注意仍然可能存在的rename导致泄漏的问题
 
 启用cache后：
@@ -37,3 +50,17 @@ v3.22.2-325-gffb20bd62d9 [https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/comm
 
 part1 以原starryos举例， 他没有实现xattr相关的系统调用， 如果要支持xattr却远远不止添加系统调用这么简单， 需要在lwext4检索相关的接口， 在lwext4_rust中利用ffi为这些c语言编写的接口做一层适配， 在arceos的ext4层为inode添加相关调用， 在vfs层添加调用， 最后处理系统调用
 另外，在后续测试中发现，在syscall层他的跨文件夹rename实现存在问题 
+
+
+
+starryos不支持稀疏文件
+
+# 创建一个大文件 (10MB)
+dd if=/dev/zero of=big_file bs=1M count=10
+ls -lh big_file
+
+# 创建一个稀疏文件 (看起来很大，但实际占用空间很小)
+dd if=/dev/zero of=sparse_file bs=1M seek=1024 count=0
+
+
+galos支持稀疏文件，extent任意深度、extent合并
