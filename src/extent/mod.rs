@@ -11,7 +11,12 @@
 //! - `write` - Extent 树写入操作（✅ 核心功能完整）
 //! - `checksum` - Extent 块校验和（✅ 完整实现）
 //! - `unwritten` - Unwritten extent 支持（✅ 完整实现）
+//! - `unwritten_multilevel` - 多层树 unwritten 支持（✅ 完整实现）
 //! - `verify` - Extent 树完整性验证（✅ 完整实现）
+//! - `grow` - 树深度增长（✅ 完整实现）
+//! - `split` - 节点分裂（✅ 完整实现）
+//! - `merge` - Extent 合并（✅ 完整实现）
+//! - `remove` - 空间移除（✅ 多层树支持）
 //!
 //! ## 主要功能
 //!
@@ -21,8 +26,8 @@
 //!
 //! ### 写入操作
 //! - `tree_init()` - 初始化 extent 树
-//! - `get_blocks()` - 获取/分配物理块（支持自动分配）
-//! - `remove_space()` - 删除/截断文件（释放物理块）
+//! - `get_blocks()` - 获取/分配物理块（支持自动分配和多层树）
+//! - `remove_space()` - 删除/截断文件（释放物理块，支持多层树）
 //! - `ExtentWriter` - 高级 extent 写入器（支持节点分裂）
 //!
 //! ### 校验和功能
@@ -35,7 +40,6 @@
 //! - `is_unwritten()` - 检查 extent 是否为 unwritten
 //! - `split_extent_at()` - 分裂 extent
 //! - `convert_to_initialized()` - 转换 unwritten extent
-//! - `zero_unwritten_range()` - 零填充未写入区域
 //!
 //! ### 完整性验证功能
 //! - `check_extent_block()` - 验证 extent 块结构
@@ -45,17 +49,19 @@
 //! ## 实现状态
 //!
 //! - ✅ 小文件支持（深度 0 的 extent 树）
+//! - ✅ 大文件支持（多层树，自动分裂/增长）
 //! - ✅ 文件创建、写入、截断、删除
 //! - ✅ 块分配和回收
 //! - ✅ CRC32C 校验和支持
 //! - ✅ Unwritten extent 支持（预分配、状态转换）
 //! - ✅ 完整性验证（结构检查、校验和验证）
-//! - ⚠️ 大文件支持（多层树需要使用 ExtentWriter）
+//! - ✅ Extent 自动合并（减少碎片化）
+//! TODO: extent模块的代码结构需要进一步优化，可以适当重构,减少代码冗余
+//! 对于类似的功能，grow.rs write.rs split.rs 可能存在多个不同的实现 
 
 mod checksum;
 mod grow;
 mod helpers;
-// mod insert; // TODO: Needs redesign to work with Vec<ExtentPathNode>
 mod merge;
 mod remove;
 mod split;
@@ -68,7 +74,6 @@ mod write;
 pub use checksum::*;
 pub use grow::grow_tree_depth;
 pub use helpers::*;
-// pub use insert::insert_index; // TODO: Needs redesign
 pub use merge::{try_merge_and_insert, MergeDirection};
 pub use remove::remove_space_multilevel;
 pub use split::split_extent_node;

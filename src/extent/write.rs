@@ -5,8 +5,8 @@
 //! ## 功能
 //!
 //! - ✅ Extent 树初始化 (`tree_init`)
-//! - ✅ Extent 插入 (简化版本 - 仅支持深度 0)
-//! - ✅ Extent 节点分裂 (ExtentWriter)
+//! - ✅ Extent 插入（支持多层树，自动分裂/增长）
+//! - ✅ Extent 节点分裂 (`split_extent_node`)
 //! - ✅ Extent 块获取/分配 (`get_blocks`)
 //!   - ✅ 查找现有映射
 //!   - ✅ 分配新块（集成 balloc）
@@ -17,17 +17,14 @@
 //!   - ✅ 部分删除（截断开头或结尾）
 //!   - ✅ 中间删除（分裂 extent）
 //!   - ✅ 自动释放物理块
-//! - ⚠️ Extent 合并（部分实现）
+//!   - ✅ 多层树支持
+//! - ✅ Extent 合并（自动合并相邻 extent）
 //!
 //! ## 依赖
 //!
 //! - Transaction 系统（用于保证原子性）
 //! - balloc 模块（用于分配和释放物理块）
-//!
-//! ## 当前限制
-//!
-//! - `insert_extent_simple` 和 `remove_space` 仅支持深度为 0 的 extent 树
-//! - 多层 extent 树支持需要使用 `ExtentWriter`
+//! TODO：write.rs过于臃肿，可以尝试逻辑与功能到不同文件中 
 
 use crate::{
     balloc::{self, BlockAllocator},
@@ -128,7 +125,8 @@ pub fn tree_init<D: BlockDevice>(inode_ref: &mut InodeRef<D>) -> Result<()> {
 /// # 返回
 ///
 /// 下一个已分配的逻辑块号，如果没有则返回 u32::MAX
-/// issue: 这个函数只处理了深度为0的情况，但是却被get_blocks调用，可能是一个bug
+/// TODO: 这个函数只处理了深度为0的情况，对于多层树总是返回 u32::MAX
+/// 虽然不会导致功能错误，但会影响连续分配的优化效果
 fn find_next_allocated_block<D: BlockDevice>(
     inode_ref: &mut InodeRef<D>,
     logical_block: u32,
@@ -214,7 +212,7 @@ fn find_goal<D: BlockDevice>(
     logical_block: u32,
     cached_extent_opt: Option<Option<ext4_extent>>,
 ) -> Result<u64> {
-    // 🚀 性能优化：使用缓存的查找结果，或者执行新查找
+    //  性能优化：使用缓存的查找结果，或者执行新查找
     let extent_opt = if let Some(cached) = cached_extent_opt {
         cached
     } else {
@@ -265,8 +263,8 @@ fn find_goal<D: BlockDevice>(
 ///
 /// - ✅ 查找现有 extent
 /// - ✅ 返回已映射的物理块
-/// - ⏳ 块分配（需要集成 balloc）
-/// - ⏳ 未初始化 extent 处理
+/// - ✅ 块分配（集成 balloc）
+/// - ✅ 多层树支持（自动分裂/增长）
 ///
 /// # 示例
 ///
@@ -327,7 +325,7 @@ pub fn get_blocks<D: BlockDevice>(
     // 而不是简化版的 insert_extent_simple
 
     // 3.1 计算可以分配多少块（不能超过下一个已分配的 extent）
-    // find_next_allocated_block无法处理深度大于0的情况， 对于深度大于0的树， 永远返回i32::MAX 虽然应该不会导致bug， 但是需要进一步优化
+    // TODO: find_next_allocated_block 对多层树返回 u32::MAX，不影响正确性但影响连续分配优化
     let next_allocated = find_next_allocated_block(inode_ref, logical_block)?;
     let mut allocated_count = if next_allocated > logical_block {
         (next_allocated - logical_block).min(max_blocks)
@@ -502,8 +500,9 @@ fn insert_extent_with_auto_split<D: BlockDevice>(
                     })
             }
             _ => {
-                // depth > 2: 需要递归遍历，暂不支持
-                // issue: depth>2 递归支持
+                // TODO: depth > 2 需要递归遍历索引树找到叶子节点
+                // 当前实现仅支持 depth <= 2，这在绝大多数情况下足够
+                // (depth=2 可支持约 340*340*32K = 3.7TB 文件)
                 log::error!("[EXTENT_INSERT] Tree depth {} not supported after grow", new_depth);
                 Err(Error::new(
                     ErrorKind::Unsupported,
@@ -1378,8 +1377,7 @@ fn determine_target_leaf_after_split<D: BlockDevice>(
 /// 插入 extent 到叶子节点（支持任意深度）
 ///
 /// 这个函数遍历 extent 树找到合适的叶子节点，然后插入 extent。
-///
-/// 注意：这个函数已废弃，请使用 insert_extent_to_leaf_direct
+#[deprecated(note = "请使用 insert_extent_to_leaf_direct")]
 #[allow(dead_code)]
 fn insert_extent_to_leaf<D: BlockDevice>(
     inode_ref: &mut InodeRef<D>,
@@ -2064,10 +2062,8 @@ impl<'a, D: BlockDevice> ExtentWriter<'a, D> {
     ///
     /// # 注意
     ///
-    /// ⚠️ **当前限制**：
-    /// - 仅支持根节点和第一层叶子节点
-    /// - 不支持深度 > 1 的树
-    /// - 不支持 extent 合并优化
+    /// 此函数通过 ExtentWriter 的事务系统提供原子性保证。
+    /// 对于简单场景，可以直接使用 `insert_extent_with_auto_split`。
     pub fn insert_extent(
         &mut self,
         inode_ref: &mut InodeRef<D>,
@@ -2370,28 +2366,13 @@ impl<'a, D: BlockDevice> ExtentWriter<'a, D> {
         )
     }
 
-    /// 合并相邻的 extent（占位实现）
+    /// 合并相邻的 extent
     ///
-    /// ⚠️ **尚未实现** - 总是返回 `Unsupported` 错误
+    /// **注意**: 此函数已废弃，extent 合并功能已在 `try_insert_to_leaf_block` 中实现。
+    /// 插入时会自动检查并合并相邻的 extent。
     ///
-    /// 对应 lwext4 的 `ext4_ext_try_to_merge()`
-    ///
-    /// # 未来实现需求
-    ///
-    /// Extent 合并需要检查：
-    /// 1. 两个 extent 在逻辑上是否连续
-    /// 2. 两个 extent 在物理上是否连续
-    /// 3. 合并后的长度是否超过最大值（32768 块）
-    /// 4. 两个 extent 的初始化状态是否相同
-    ///
-    /// # 参数
-    ///
-    /// * `path` - Extent 路径
-    /// * `new_extent` - 新插入的 extent
-    ///
-    /// # 返回
-    ///
-    /// `Err(Unsupported)` - 功能未实现
+    /// 如需使用合并功能，请参考 `merge.rs` 模块中的 `try_merge_and_insert` 函数。
+    #[deprecated(note = "extent 合并已在 try_insert_to_leaf_block 中自动实现")]
     pub fn try_merge_extent(
         &mut self,
         _path: &mut ExtentPath,
@@ -2399,7 +2380,7 @@ impl<'a, D: BlockDevice> ExtentWriter<'a, D> {
     ) -> Result<bool> {
         Err(Error::new(
             ErrorKind::Unsupported,
-            "Extent merging not yet implemented",
+            "Use try_insert_to_leaf_block which auto-merges",
         ))
     }
 
@@ -2471,10 +2452,10 @@ impl<'a, D: BlockDevice> ExtentWriter<'a, D> {
 /// # 实现状态
 ///
 /// - ✅ 支持深度 0 的 extent 树
+/// - ✅ 支持多层 extent 树（通过 remove_space_multilevel）
 /// - ✅ 完全删除 extent
 /// - ✅ 部分删除 extent（截断开头或结尾）
 /// - ✅ 分裂 extent（删除中间部分）
-/// - ⏳ 多层 extent 树（待完善）
 ///
 /// # 示例
 ///

@@ -45,6 +45,7 @@ impl BlockAllocator {
     /// # 注意
     ///
     /// 此版本不更新 inode 的 blocks 计数，调用者需要自己处理
+    /// TODO: 数据块的分配算法仍然有优化空间，可以考虑使用更高效的算法
     pub fn alloc_block<D: BlockDevice>(
         &mut self,
         bdev: &mut BlockDev<D>,

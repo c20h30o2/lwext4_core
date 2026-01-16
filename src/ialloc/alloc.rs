@@ -39,6 +39,7 @@ impl InodeAllocator {
     /// # 返回
     ///
     /// 成功返回分配的 inode 编号
+    /// TODO: 分配算法仍然有优化空间，可以考虑使用更高效的算法，比如使用位图索引树等。
     pub fn alloc_inode<D: BlockDevice>(
         &mut self,
         bdev: &mut BlockDev<D>,

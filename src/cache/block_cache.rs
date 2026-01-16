@@ -38,6 +38,7 @@
 //!     stats: CacheStats,                   // 统计信息
 //! }
 //! ```
+//! 注意：block_cache重构后，device与cache的职责已经分离，device负责实际的I/O操作，cache负责缓存管理。我们希望所有flush相关的动作都由device完成。
 
 use crate::{
     block::BlockDevice,
@@ -175,6 +176,8 @@ impl BlockCache {
     /// }
     /// // 使用buf...
     /// ```
+    /// TODO:如果多处想要引用同一逻辑块的cache，当前的实现无法满足并发只读的需求，只能做到串行访问。
+    /// 因为cache的操作通过block handle进行，而block handle需要持有device的mut引用，同一时刻只能有一个block handle。
     pub fn alloc(&mut self, lba: u64) -> Result<(&mut CacheBuffer, bool)> {
         self.stats.total_accesses += 1;
 
@@ -195,12 +198,12 @@ impl BlockCache {
         // 检查脏块比例 - 如果超过80%发出警告
         let dirty_ratio = (self.dirty_set.len() * 100) / self.cache.len().max(1);
         if dirty_ratio > 80 {
-            log::warn!(
-                "[CACHE] High dirty ratio: {}/{} ({}%). Consider calling flush_all()",
-                self.dirty_set.len(),
-                self.cache.len(),
-                dirty_ratio
-            );
+            // log::warn!(
+            //     "[CACHE] High dirty ratio: {}/{} ({}%). Consider calling flush_all()",
+            //     self.dirty_set.len(),
+            //     self.cache.len(),
+            //     dirty_ratio
+            // );
         }
 
         // 新块：需要检查是否满
@@ -235,6 +238,7 @@ impl BlockCache {
 
         // 从LRU端（最老的）开始查找非脏块
         // 注意：iter()已经是LRU到MRU顺序，不需要rev()
+        // TODO：这里的算法或许可以进一步优化
         for lba in keys.iter() {
             if !self.dirty_set.contains(lba) {
                 // 找到非脏块，驱逐它
@@ -246,7 +250,8 @@ impl BlockCache {
 
         // 所有块都是脏的，返回NoSpace错误
         // 调用者应该flush一些脏块后重试
-        log::error!("[CACHE] Cannot evict: all {} blocks are dirty! Need flush before alloc.", self.cache.len());
+        // prepare for contest replace error with info
+        log::info!("[CACHE] Cannot evict: all {} blocks are dirty! Need flush before alloc.", self.cache.len());
         Err(Error::new(
             ErrorKind::NoSpace,
             "All cache blocks are dirty, cannot evict. Caller must flush before alloc."
@@ -266,6 +271,8 @@ impl BlockCache {
     /// 如果找到返回块的可变引用，否则返回 None
     ///
     /// 注意：get_mut 会自动更新LRU顺序
+    /// TODO: 这个方法已经不再使用，因为重构了device与cache的职责，
+    /// 现在device负责实际的I/O操作，cache负责缓存管理。将来或许考虑删除这个方法。
     pub fn find_get(&mut self, lba: u64) -> Option<&mut CacheBuffer> {
         self.stats.total_accesses += 1;
 
@@ -339,6 +346,8 @@ impl BlockCache {
         Err(Error::new(ErrorKind::NotFound, "Block not in cache"))
     }
 
+    /// TODO: flush_lba flush_all 这两个方法已经不再使用，因为重构了device与cache的职责，
+    /// 现在device负责实际的I/O操作，cache负责缓存管理。将来或许考虑删除这两个方法。
     /// 刷新单个块到磁盘
     ///
     /// # 参数

@@ -218,7 +218,7 @@ pub fn ext4_idx_store_pblock(idx: &mut ext4_extent_idx, pblock: u64) {
         );
     }
 
-    log::info!(
+    log::trace!(
         "[ext4_idx_store_pblock] Stored pblock={:#x} -> leaf_lo={:#x}, leaf_hi={:#x}",
         pblock, u32::from_le(idx.leaf_lo), u16::from_le(idx.leaf_hi)
     );
@@ -240,15 +240,12 @@ pub fn ext4_idx_pblock(idx: &ext4_extent_idx) -> u64 {
     let hi = u16::from_le(idx.leaf_hi) as u64;
     let pblock = lo | (hi << 32);
 
-    // 验证读取的物理块号是否合理
-    // ext4最大物理块地址是2^48-1，设备通常远小于此
-    // 如果leaf_hi非零且值很大，可能是损坏的数据
-    if hi > 0 {
-        log::warn!(
-            "[ext4_idx_pblock] Reading extent index with non-zero leaf_hi: leaf_lo={:#x}, leaf_hi={:#x} ({} decimal), pblock={:#x}",
-            lo as u32, hi as u16, hi, pblock
-        );
-    }
+    // 注意：leaf_hi 非零是正常情况，表示物理块号超过 32 位
+    // ext4 支持最大 48 位物理块地址
+    log::trace!(
+        "[ext4_idx_pblock] Read pblock={:#x} (leaf_lo={:#x}, leaf_hi={:#x})",
+        pblock, lo as u32, hi as u16
+    );
 
     pblock
 }
@@ -289,16 +286,6 @@ pub fn ext4_ext_pblock(extent: &ext4_extent) -> u64 {
         u32::from_le(extent.block), u16::from_le(extent.len),
         pblock
     );
-
-    // 检测异常值（超过设备容量）
-    if pblock > 2097152 {
-        log::warn!(
-            "[EXTENT_READ] ⚠️ SUSPICIOUS pblock=0x{:x} (decimal: {}) - EXCEEDS DEVICE CAPACITY! extent: logical={}, len={}, start_lo=0x{:x}, start_hi=0x{:x}",
-            pblock, pblock,
-            u32::from_le(extent.block), u16::from_le(extent.len),
-            extent.start_lo, extent.start_hi
-        );
-    }
 
     pblock
 }
@@ -417,9 +404,10 @@ mod tests {
     #[test]
     fn test_idx_pblock() {
         let mut idx = ext4_extent_idx {
-            first_block: 0,
+            block: 0,
             leaf_lo: 0,
             leaf_hi: 0,
+            unused: 0,
         };
 
         // 测试存储和读取
@@ -439,7 +427,7 @@ mod tests {
     #[test]
     fn test_ext_pblock() {
         let mut extent = ext4_extent {
-            first_block: 0,
+            block: 0,
             len: 0,
             start_hi: 0,
             start_lo: 0,

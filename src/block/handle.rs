@@ -98,7 +98,8 @@ impl<'a, D: BlockDevice> Block<'a, D> {
                     // Cache满且都是脏块 - 主动flush后重试
                     let flush_count = cache.capacity() / 4;
                     drop(cache); // 释放借用
-                    log::warn!("[Block::get] Cache full with dirty blocks, flushing {} blocks", flush_count);
+                    // prepare for contest replace warn with info
+                    log::info!("[Block::get] Cache full with dirty blocks, flushing {} blocks", flush_count);
 
                     // Flush 25%的cache容量
                     block_dev.flush_some_dirty_blocks(flush_count)?;
@@ -184,7 +185,8 @@ impl<'a, D: BlockDevice> Block<'a, D> {
                 Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
                     let flush_count = cache.capacity() / 4;
                     drop(cache); // 释放借用
-                    log::warn!("[Block::get_noread] Cache full, flushing {} blocks", flush_count);
+                    // prepare for contest replace warn with info       
+                    log::info!("[Block::get_noread] Cache full, flushing {} blocks", flush_count);
                     block_dev.flush_some_dirty_blocks(flush_count)?;
                     block_dev.bcache.as_mut().unwrap().alloc(lba)?
                 }
@@ -244,7 +246,8 @@ impl<'a, D: BlockDevice> Block<'a, D> {
                 Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
                     let flush_count = cache.capacity() / 4;
                     drop(cache); // 释放借用
-                    log::warn!("[Block::with_data] Cache full, flushing {} blocks", flush_count);
+                    // prepare for contest replace warn with info
+                    log::info!("[Block::with_data] Cache full, flushing {} blocks", flush_count);
                     self.block_dev.flush_some_dirty_blocks(flush_count)?;
                     self.block_dev.bcache.as_mut().unwrap().alloc(self.lba)?
                 }
@@ -285,7 +288,8 @@ impl<'a, D: BlockDevice> Block<'a, D> {
                 Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
                     let flush_count = cache.capacity() / 4;
                     drop(cache); // 释放借用
-                    log::warn!("[Block::with_data_mut] Cache full, flushing {} blocks", flush_count);
+                    // prepare for contest replace warn with info
+                    log::info!("[Block::with_data_mut] Cache full, flushing {} blocks", flush_count);
                     self.block_dev.flush_some_dirty_blocks(flush_count)?;
                     self.block_dev.bcache.as_mut().unwrap().alloc(self.lba)?
                 }

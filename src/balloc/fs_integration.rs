@@ -1,6 +1,7 @@
 //! balloc 与文件系统的集成
 //!
 //! 提供与 InodeRef 集成的块分配/释放函数，自动更新 inode blocks 计数
+//! issue: 实际并未被使用
 
 use crate::{
     block::{BlockDev, BlockDevice},

@@ -346,6 +346,7 @@ impl<D: BlockDevice> BlockDev<D> {
         self.device.block_size() / self.device.sector_size()
     }
 
+    /// issue：当前这些计数的追踪并不准确
     /// 增加读计数
     pub(super) fn inc_read_count(&mut self) {
         self.read_count += 1;
@@ -381,6 +382,7 @@ impl<D: BlockDevice> BlockDev<D> {
     /// 如果块不在缓存中或写入失败，返回错误
     pub fn flush_lba(&mut self, lba: u64) -> Result<()> {
         // 先获取必要参数，避免借用冲突
+        // TODO: 需要进一步考虑如何重构以避免使用蹩脚、低效的方式绕开引用检查，类似的代码还有多处
         let sector_size = self.device.sector_size();
         let partition_offset = self.partition_offset;
         let block_size = self.block_size();

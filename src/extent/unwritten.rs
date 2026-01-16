@@ -151,7 +151,8 @@ pub fn get_pblock(extent: &ext4_extent) -> u64 {
 ///
 /// # 限制
 ///
-/// 当前仅支持深度 0 的 extent 树
+/// 此函数仅支持深度 0 的 extent 树。
+/// 对于多层树，请使用 `unwritten_multilevel::split_extent_at_multilevel`。
 pub fn split_extent_at<D: BlockDevice>(
     inode_ref: &mut InodeRef<D>,
     _sb: &mut Superblock,

@@ -61,7 +61,8 @@ impl<D: BlockDevice> BlockDev<D> {
                         // 先获取capacity，然后释放借用
                         let flush_count = cache.capacity() / 4;
                         drop(cache); // 显式释放借用
-                        log::warn!("[read_block] Cache full, flushing {} blocks", flush_count);
+                        // prepare for contest replace warn with info
+                        log::info!("[read_block] Cache full, flushing {} blocks", flush_count);
                         self.flush_some_dirty_blocks(flush_count)?;
                         // 重新借用并重试
                         self.bcache.as_mut().unwrap().alloc(lba)?
@@ -118,13 +119,15 @@ impl<D: BlockDevice> BlockDev<D> {
                 Err(_) => {
                     // 块不在缓存中 - 分配新块并写入
                     // 使用主动flush机制
+                    // flush的工作现在在device中完成，cache只需要负责缓存管理
                     let result = cache.alloc(lba);
                     let (cache_buf, _is_new) = match result {
                         Ok(result) => result,
                         Err(e) if e.kind() == crate::error::ErrorKind::NoSpace => {
                             let flush_count = cache.capacity() / 4;
                             drop(cache); // 显式释放借用
-                            log::warn!("[write_block] Cache full, flushing {} blocks", flush_count);
+                            // prepare for contest replace warn with info
+                            log::info!("[write_block] Cache full, flushing {} blocks", flush_count);
                             self.flush_some_dirty_blocks(flush_count)?;
                             // 重新获取cache并分配
                             let cache = self.bcache.as_mut().unwrap();
