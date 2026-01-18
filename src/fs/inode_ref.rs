@@ -51,9 +51,10 @@ pub struct InodeRef<'a, D: BlockDevice> {
     offset_in_block: usize,
     /// 是否已标记为脏
     dirty: bool,
-    /// 块映射缓存：(logical_block, physical_block)
-    /// 用于加速重复的extent树查找
-    block_map_cache: Option<(u32, u64)>,
+    /// 块映射缓存：(extent_logical_start, extent_len, physical_start)
+    /// 🚀 性能优化：缓存整个extent的范围信息，而不是单个块
+    /// 这样对于顺序访问，多个相邻块可以共享同一个缓存entry
+    block_map_cache: Option<(u32, u32, u64)>,
 }
 
 impl<'a, D: BlockDevice> InodeRef<'a, D> {
@@ -604,14 +605,18 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
             }
         } else {
             // 使用 extent 树映射
-            if !create {
-                // 检查缓存
-                if let Some((cached_logical, cached_physical)) = self.block_map_cache {
-                    if cached_logical == logical_block {
-                        return Ok(cached_physical);
-                    }
-                }
 
+            // 🚀 性能优化：写入模式下也先检查缓存
+            // 缓存存储整个extent的范围，对于顺序访问有极高的命中率
+            if let Some((extent_start, extent_len, physical_start)) = self.block_map_cache {
+                if logical_block >= extent_start && logical_block < extent_start + extent_len {
+                    let offset = logical_block - extent_start;
+                    let physical_block = physical_start + offset as u64;
+                    return Ok(physical_block);
+                }
+            }
+
+            if !create {
                 // 只读模式：使用 ExtentTree 查找
                 // 注意：这里使用快照是安全的，因为：
                 // 1. self (InodeRef) 持有对 inode 块的独占访问
@@ -622,8 +627,9 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
 
                 match extent_tree.map_block_internal(&inode_copy, logical_block)? {
                     Some(physical_block) => {
-                        // 更新缓存
-                        self.block_map_cache = Some((logical_block, physical_block));
+                        // 更新缓存（暂时缓存单个块，长度=1）
+                        // TODO: 优化为缓存完整的extent范围
+                        self.block_map_cache = Some((logical_block, 1, physical_block));
                         Ok(physical_block)
                     }
                     None => Err(Error::new(
@@ -632,7 +638,7 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
                     )),
                 }
             } else {
-                // 写入模式：使用 get_blocks 进行分配
+                // 写入模式：使用 get_blocks 进行分配或查找
                 // 安全性说明：
                 // - get_blocks 需要 &mut Superblock 但 self 已持有 &mut sb
                 // - 使用 unsafe 指针绕过借用检查器
@@ -657,7 +663,7 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
                 // 所以即使每个块一个 extent 也能正常工作
                 let speculative_blocks = 1;
 
-                let (physical_block, _allocated_count) =
+                let (physical_block, allocated_count) =
                     get_blocks(self, sb_ref, &mut allocator, logical_block, speculative_blocks, true)?;
 
                 if physical_block == 0 {
@@ -666,6 +672,9 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
                         "Failed to allocate block",
                     ))
                 } else {
+                    // 🚀 更新缓存：缓存分配/查找到的块范围
+                    // allocated_count表示从logical_block开始的连续块数
+                    self.block_map_cache = Some((logical_block, allocated_count, physical_block));
                     Ok(physical_block)
                 }
             }
@@ -926,6 +935,9 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
             let mut bytes_read = 0;
             let mut current_offset = offset;
 
+            // 🚀 性能优化：复用块缓冲区
+            let mut block_buf = alloc::vec![0u8; block_size as usize];
+
             while bytes_read < to_read {
                 let logical_block = (current_offset / block_size) as u32;
                 let offset_in_block = (current_offset % block_size) as usize;
@@ -942,8 +954,7 @@ impl<'a, D: BlockDevice> InodeRef<'a, D> {
                         #[cfg(feature = "std")]
                         eprintln!("[inode_ref] Physical block={}", physical_block);
 
-                        // 读取块数据
-                        let mut block_buf = alloc::vec![0u8; block_size as usize];
+                        // 读取块数据（复用 block_buf）
                         let result = self.bdev.read_blocks_direct(physical_block, 1, &mut block_buf);
 
                         #[cfg(feature = "std")]

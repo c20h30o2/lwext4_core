@@ -207,49 +207,12 @@ impl<D: BlockDevice> File<D> {
             return Ok(0);
         }
 
-        // 计算当前 offset 对应的逻辑块号和块内偏移
-        let block_size = self.block_size as u64;
-        let logical_block = (self.offset / block_size) as u32;
-        let offset_in_block = (self.offset % block_size) as usize;
-
-        // 计算本次写入的数据量（不超过当前块的剩余空间）
-        let remaining_in_block = block_size as usize - offset_in_block;
-        let write_len = buf.len().min(remaining_in_block);
-
-        // 使用 InodeRef 获取或分配物理块
-        let physical_block = {
-            let mut inode_ref = fs.get_inode_ref(self.inode_num)?;
-            inode_ref.get_inode_dblk_idx(logical_block, true)? // create=true 自动分配
-        }; // inode_ref 在此 drop，自动写回修改
-
-        if physical_block == 0 {
-            return Err(Error::new(
-                ErrorKind::NoSpace,
-                "Failed to allocate block for write",
-            ));
-        }
-
-        // 读取整个块（如果块是新分配的，会读到全零）
-        let mut block_buf = alloc::vec![0u8; block_size as usize];
-        fs.bdev.read_block(physical_block, &mut block_buf)?;
-
-        // 在块内写入数据
-        block_buf[offset_in_block..offset_in_block + write_len]
-            .copy_from_slice(&buf[..write_len]);
-
-        // 写回块
-        fs.bdev.write_block(physical_block, &block_buf)?;
+        // 🚀 性能优化：使用批量写入接口，一次性处理所有数据
+        // 相比单块写入，避免了多次 InodeRef 获取/释放
+        let write_len = fs.write_at_inode_batch(self.inode_num, buf, self.offset)?;
 
         // 更新文件位置
         self.offset += write_len as u64;
-
-        // 如果写入超过了文件末尾，更新文件大小
-        let current_size = self.size(fs)?;
-        if self.offset > current_size {
-            let mut inode_ref = fs.get_inode_ref(self.inode_num)?;
-            inode_ref.set_size(self.offset)?;
-            inode_ref.mark_dirty()?;
-        }
 
         Ok(write_len)
     }

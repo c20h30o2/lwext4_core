@@ -1,38 +1,39 @@
-1.尝试使用现有的 lru crate 替换当前的block cache lru的简单实现， 并且进一步验证启用cache时的一致性与可靠性
-2.删除capi等不打算继续实现的模块
-更多代办：
-常用文件命令自动化全面测试脚本 
+尝试使用现有的 lru crate 替换当前的block cache lru的简单实现， 并且进一步验证启用cache时的一致性与可靠性（完成）
 cache修复与优化（完成） 
 文件截断实现（完成） 
 连续块分配实现（完成） 
 复杂功能支持（extent递归分裂、深度增长，这些功能未实现，导致add gcc失败，已实现，apk add gcc成功，且apk add gcc musl-dev make成功，并且gcc -o test test.c编译成功） 
 
+常用文件命令自动化全面测试脚本 
 文件时间问题（touch mkdir创建的项目时间都是1970开始，而echo创建日期正确，但时间不精准，原starryos也有这个问题） 
 日志功能整合 
-crc校验整合 
+xattr模块功能整合
 高级功能支持(支持特殊文件的创建，比如socket fifo文件，支持xattr相关调用) 
 性能优化（add vim总是在89%停留很长时间、分配与回收的高级优化）
 彻底移除lwext4_rust以减少编译时间
+代码风格优化，消除编译警告
+crc校验整合 
+删除capi等不打算继续实现的模块
+
 
 starryos层面：添加xattr系列系统调用、mkfifo系列特殊文件系统调用，以及更多文件系统相关系统调用支持， 
 完善inode引用计数，控制inode释放时机
 注意仍然可能存在的rename导致泄漏的问题
+rename失败的问题 详情见/home/c20h30o2/files/GalOS/logs/lwext4_core/ext4testlogs/command-test.log
 
-启用cache后：
-starry:~# apk add vim
-[  5.545231 0:10 starry_api::syscall::fs::fd_ops:138] [OPEN] openat FAILED: path=/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
-[  5.546202 0:10 starry_api::syscall::fs::fd_ops:138] [OPEN] openat FAILED: path=/usr/local/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
-[  5.638928 0:10 starry_api::syscall::fs::fd_ops:138] [OPEN] openat FAILED: path=etc/apk/cache, error=AxErrorKind::NotFound
-fetch https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/main/riscv64/APKINDEX.tar.gz
-[  6.042771 0:10 axfs_ng::fs::ext4::wrapper:360] [ext4] READ FAILED: ino=26, len=4096, offset=507904, error=Ext4Error { code: 28, message: Some("All cache blocks are referenced, cannot evict") }
-[  6.045063 0:10 axfs_ng::fs::ext4::util:19] [ext4] Error occurred: code=28 (ENOSPC), message=Some("All cache blocks are referenced, cannot evict")
-[  6.046022 0:10 axfs_ng::fs::ext4::util:26] [ext4] Converted to VfsError: AxErrorKind::StorageFull
-[  6.046656 0:10 axfs_ng::highlevel::file:508] [CachedFile] page_or_insert: read FAILED for page 124, error=AxErrorKind::StorageFull
-[  6.047467 0:10 axmm::aspace:348] FailedAfter testing, "apk add gcc" is now supported, and running "add gcc musl-dev make" can compile and run C programs. However, "git clone" is currently not working correctly, and it's unclear whether this is a problem with lwext4_core. to populate pages for VA:0x48838a (READ | EXECUTE | USER): No storage space
-Segmentation fault (core dumped)
+完善os,使其支持更多测试方式，如fio dbench，详情：
+尝试clone复杂项目并进行编译，os不支持
+尝试利用fio、dbench进行高压测试，os不支持
+尝试使用sh脚本进行大量循环测试，os不支持
+
+更多代办：
+进一步检查代码并添加todo：     to be check   dir\extent\fs\journal\transaction\xattr
+处理代码文件中的todo
 
 
-其他：探索修复好apk add vim的同时，apk update也被修复好的原因， 在做出这些修改之前， apk update 总是输出：
+
+其他：
+探索修复好apk add vim的同时，apk update也被修复好的原因， 在做出这些修改之前， apk update 总是输出：
 starry:~# apk update
 [  6.881265 0:10 starry_api::syscall::fs::fd_ops:137] [OPEN] openat FAILED: path=/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
 [  6.882483 0:10 starry_api::syscall::fs::fd_ops:137] [OPEN] openat FAILED: path=/usr/local/lib/libapk.so.2.14.9, error=AxErrorKind::NotFound
@@ -49,28 +50,29 @@ v3.22.2-325-gffb20bd62d9 [https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.22/comm
 
 
 
-part1 以原starryos举例， 他没有实现xattr相关的系统调用， 如果要支持xattr却远远不止添加系统调用这么简单， 需要在lwext4检索相关的接口， 在lwext4_rust中利用ffi为这些c语言编写的接口做一层适配， 在arceos的ext4层为inode添加相关调用， 在vfs层添加调用， 最后处理系统调用
-另外，在后续测试中发现，在syscall层他的跨文件夹rename实现存在问题 
 
 
 
-starryos不支持稀疏文件
 
+
+
+测试1：
 # 创建一个大文件 (10MB)
 dd if=/dev/zero of=big_file bs=1M count=10
 ls -lh big_file
 
 # 创建一个稀疏文件 (看起来很大，但实际占用空间很小)
 dd if=/dev/zero of=sparse_file bs=1M seek=1024 count=0
-
-
 galos支持稀疏文件，extent任意深度、extent合并
+
+
+测试2：
 可运行复杂程序测试， 如apk add vim gcc， add gcc musl-dev make, gcc -o test test.c， 
 
 apk update
 apk add vim gcc busybox coreutils 
 
-apk add gcc make
+apk add gcc make musl-dev
 git clone some_small_project
 cd project
 make -j4
@@ -78,7 +80,7 @@ make -j4
 
 
 
-
+其他测试1：
 一、为什么“跑真实程序”比脚本更有效
 
 因为真实程序会同时覆盖：
@@ -334,3 +336,316 @@ OS 研究生
 这一套做完，你基本可以：
 
 把 lwext4 当成一个“可投产文件系统”来看待。
+
+
+
+
+
+
+
+其他测试2：
+一、测试分层设计原则
+
+我们按 依赖程度递增 设计测试：
+
+| 层级 | 目标 | 依赖 OS 功能 |
+|------|------|
+| L0 | 块设备基本吞吐 | 只需 open/read/write |
+| L1 | 基本文件系统性能 | 路径解析 + 文件 I/O |
+| L2 | 元数据密集型 | mkdir/link/unlink/stat |
+| L3 | 真实程序行为 | fork/exec + libc |
+| L4 | 专业 benchmark | 完整 POSIX + syscalls |
+
+你可以根据当前 GalOS 支持程度，逐层推进。
+
+🟢 L0：几乎只测试块层与页缓存（最容易跑）
+
+这些测试 几乎不需要复杂内核功能，非常适合最初对比。
+
+1. dd 顺序写
+sync
+echo 3 > /proc/sys/vm/drop_caches  # 若支持
+dd if=/dev/zero of=testfile bs=4k count=100000 conv=fdatasync
+
+
+记录输出中的：
+
+MB/s
+
+
+测试意义：
+
+ext4 + journal 对顺序写的影响
+
+bcache 与 flush 策略
+
+2. dd 顺序读
+dd if=testfile of=/dev/null bs=4k
+
+
+比较两系统：
+
+读缓存命中率
+
+页缓存效率
+
+3. 不经过页缓存的写（若支持 O_DIRECT）
+dd if=/dev/zero of=testfile bs=4k count=50000 oflag=direct
+
+
+意义：
+
+接近真实 block device 性能
+
+ext4 分配策略是否高效
+
+🟢 L1：普通文件操作性能
+4. 大量小文件创建
+time for i in $(seq 1 10000); do
+  echo hello > f_$i
+done
+
+
+测：
+
+inode 分配效率
+
+directory 操作效率
+
+journaling 元数据开销
+
+5. stat 密集型
+time for i in f_*; do
+  stat $i >/dev/null
+done
+
+
+测试：
+
+路径查找
+
+inode cache 命中率
+
+dentry 管理效率
+
+6. unlink 压力测试
+time rm f_*
+
+
+这是 ext4 的一个重要性能点：
+
+orphan inode
+
+journaling revoke
+
+truncate + free blocks
+
+🟡 L2：元数据密集 + 树结构
+7. 深目录测试
+d=deep
+mkdir $d
+for i in $(seq 1 1000); do
+  d="$d/$i"
+  mkdir "$d"
+done
+
+
+然后：
+
+cd "$d"
+pwd
+
+
+测试：
+
+path walk 正确性
+
+目录缓存
+
+lookup 复杂度
+
+8. rename 压力测试
+for i in $(seq 1 5000); do
+  echo x > a
+  mv a b
+  mv b a
+done
+
+
+这是：
+
+journaling correctness
+
+rename 原子性
+
+directory entry 更新完整性
+
+🔵 L3：真实应用级行为测试
+
+这些开始体现“真实用户行为”，但需要：
+
+fork
+
+exec
+
+ELF loader
+
+libc 基本功能
+
+9. 编译小型项目（你之前已经提到）
+
+例如：
+
+git clone https://github.com/madler/zlib.git
+cd zlib
+./configure
+make
+
+
+然后对比：
+
+总时间
+
+是否出现随机失败
+
+是否有异常 I/O 错误
+
+10. tar 压缩/解压测试
+
+非常适合文件系统 benchmark：
+
+tar -czf test.tar.gz bigdir/
+rm -rf bigdir
+tar -xzf test.tar.gz
+
+
+这是：
+
+顺序读写
+
+metadata 扫描
+
+create/unlink 混合测试
+
+🔴 L4：专业 benchmark（你说对，目前 OS 跑不了，但你应该设计目标）
+
+这些是 未来你实现更多 syscall 后的目标：
+
+fio（文件系统终极 benchmark）
+
+典型测试：
+
+[global]
+ioengine=sync
+direct=0
+size=256M
+runtime=30
+time_based
+group_reporting
+
+[randread]
+rw=randread
+bs=4k
+
+[randwrite]
+rw=randwrite
+bs=4k
+
+[seqread]
+rw=read
+bs=128k
+
+[seqwrite]
+rw=write
+bs=128k
+
+
+运行：
+
+fio test.fio
+
+
+fio 能测：
+
+IOPS
+
+延迟分布
+
+顺序 / 随机
+
+fsync 行为
+
+journal 写放大
+
+fs_mark
+
+专测元数据性能：
+
+fs_mark -d /mnt/test -t 4 -n 100000
+
+
+测试：
+
+inode allocation
+
+directory scalability
+
+journal 负担
+
+dbench
+
+模拟 Samba 文件服务器负载：
+
+dbench 4
+
+
+能暴露：
+
+rename + unlink 组合 bug
+
+cache coherence 问题
+
+lock 设计缺陷
+
+📊 建议你建立一个对比测试表
+
+比如：
+
+测试	Old OS	New OS (lwext4)	备注
+dd write 400MB	12 MB/s	9 MB/s	journal overhead
+create 10k files	1.2s	2.1s	inode path slower
+rm 10k files	0.5s	3.8s	revoke handling slow
+make zlib	4.2s	6.9s	path walk cost
+
+这样你会非常清晰地看到：
+
+lwext4_core 带来了哪些语义提升？代价在哪里？是否合理？
+
+回答你核心目标
+
+我希望比较旧 OS 与引入 lwext4_core 后的性能差异
+
+非常正确，而且：
+
+dd、mkdir、rm、stat、rename → 是文件系统实现质量的直接反映
+
+fio → 是最终工业标准 benchmark
+
+编译真实项目 → 是最接近真实负载
+
+你走的路径非常接近 内核文件系统工程师真实工作方式。
+
+如果你愿意，我可以继续帮你：
+
+我可以帮你直接生成：
+
+✔ 一份完整的测试脚本（自动跑所有 L0-L3 测试并输出报告）
+✔ 一份 CSV 输出，方便你做性能对比
+✔ 一个“回归测试集”，用于你以后改 lwext4_core 时验证没有引入新 bug
+✔ 一个 fio 测试模板，等你 syscalls 补齐就能直接用
+
+如果你说一句：
+
+“帮我做一套自动化 benchmark 脚本”
+
+我可以直接给你可执行版本。

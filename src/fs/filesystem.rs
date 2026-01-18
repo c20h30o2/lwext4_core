@@ -1774,11 +1774,14 @@ impl<D: BlockDevice> Ext4FileSystem<D> {
         let remaining_in_block = block_size as usize - offset_in_block;
         let write_len = buf.len().min(remaining_in_block);
 
+        // 🚀 性能优化：只获取一次 InodeRef，避免重复的 inode 块查找
+        let mut inode_ref = InodeRef::get(&mut self.bdev, &mut self.sb, inode_num)?;
+
+        // 获取当前文件大小（后面需要判断是否需要更新）
+        let current_size = inode_ref.size()?;
+
         // 获取或分配物理块
-        let physical_block = {
-            let mut inode_ref = InodeRef::get(&mut self.bdev, &mut self.sb, inode_num)?;
-            inode_ref.get_inode_dblk_idx(logical_block, true)? // create=true 自动分配
-        }; // inode_ref 在此 drop，自动写回修改
+        let physical_block = inode_ref.get_inode_dblk_idx(logical_block, true)?; // create=true 自动分配
 
         if physical_block == 0 {
             return Err(Error::new(
@@ -1787,27 +1790,117 @@ impl<D: BlockDevice> Ext4FileSystem<D> {
             ));
         }
 
-        // 读取整个块
+        // 通过 InodeRef 访问 bdev（避免释放 InodeRef）
+        let bdev = inode_ref.bdev_mut();
+
+        // 🚀 性能优化：全块写入时跳过读取
         let mut block_buf = alloc::vec![0u8; block_size as usize];
-        self.bdev.read_block(physical_block, &mut block_buf)?;
+        let is_full_block_write = offset_in_block == 0 && write_len == block_size as usize;
+
+        if !is_full_block_write {
+            // 部分块写入：需要先读取
+            bdev.read_block(physical_block, &mut block_buf)?;
+        }
+        // 全块写入：跳过读取，直接覆盖（block_buf 已初始化为 0）
 
         // 在块内写入数据
         block_buf[offset_in_block..offset_in_block + write_len]
             .copy_from_slice(&buf[..write_len]);
 
         // 写回块
-        self.bdev.write_block(physical_block, &block_buf)?;
+        bdev.write_block(physical_block, &block_buf)?;
 
         // 更新文件大小（如果写入超过了文件末尾）
         let new_end = offset + write_len as u64;
-        let mut inode_ref = InodeRef::get(&mut self.bdev, &mut self.sb, inode_num)?;
-        let current_size = inode_ref.size()?;
         if new_end > current_size {
             inode_ref.set_size(new_end)?;
             inode_ref.mark_dirty()?;
         }
 
+        // InodeRef 在此 drop，自动写回修改
         Ok(write_len)
+    }
+
+    /// 批量写入数据到指定 inode（性能优化版本）
+    ///
+    /// 与 write_at_inode 不同，此方法可以一次写入多个块，
+    /// 避免重复获取 InodeRef，显著提升大文件写入性能。
+    ///
+    /// # 参数
+    ///
+    /// * `inode_num` - inode 编号
+    /// * `buf` - 要写入的数据
+    /// * `offset` - 写入起始偏移量（字节）
+    ///
+    /// # 返回
+    ///
+    /// 实际写入的字节数
+    ///
+    /// # 性能
+    ///
+    /// - 100000块写入：write_at_inode需要100000次InodeRef获取
+    /// - 100000块写入：write_at_inode_batch只需要1次InodeRef获取
+    ///
+    /// 预期性能提升：2-3倍
+    pub fn write_at_inode_batch(&mut self, inode_num: u32, buf: &[u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        let block_size = self.sb.block_size() as u64;
+
+        // 🚀 关键优化：只获取一次 InodeRef，处理所有块
+        let mut inode_ref = InodeRef::get(&mut self.bdev, &mut self.sb, inode_num)?;
+        let current_size = inode_ref.size()?;
+
+        let mut bytes_written = 0;
+        let mut current_offset = offset;
+
+        // 🚀 性能优化：复用块缓冲区，避免循环内的重复分配
+        let mut block_buf = alloc::vec![0u8; block_size as usize];
+
+        while bytes_written < buf.len() {
+            let logical_block = (current_offset / block_size) as u32;
+            let offset_in_block = (current_offset % block_size) as usize;
+            let remaining_in_block = block_size as usize - offset_in_block;
+            let write_len = (buf.len() - bytes_written).min(remaining_in_block);
+
+            // 获取或分配物理块
+            let physical_block = inode_ref.get_inode_dblk_idx(logical_block, true)?;
+            if physical_block == 0 {
+                return Err(Error::new(ErrorKind::NoSpace, "Failed to allocate block"));
+            }
+
+            // 通过 InodeRef 访问 bdev
+            let bdev = inode_ref.bdev_mut();
+
+            // 优化：全块写入时跳过读取
+            let is_full_block = offset_in_block == 0 && write_len == block_size as usize;
+
+            if !is_full_block {
+                bdev.read_block(physical_block, &mut block_buf)?;
+            }
+            // 全块写入时不需要读取，直接覆盖（block_buf会被完全覆盖）
+
+            // 写入数据
+            block_buf[offset_in_block..offset_in_block + write_len]
+                .copy_from_slice(&buf[bytes_written..bytes_written + write_len]);
+
+            // 写回块
+            bdev.write_block(physical_block, &block_buf)?;
+
+            bytes_written += write_len;
+            current_offset += write_len as u64;
+        }
+
+        // 更新文件大小
+        let new_end = offset + bytes_written as u64;
+        if new_end > current_size {
+            inode_ref.set_size(new_end)?;
+            inode_ref.mark_dirty()?;
+        }
+
+        Ok(bytes_written)
     }
 
     /// 获取 inode 的属性（元数据）

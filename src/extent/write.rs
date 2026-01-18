@@ -346,8 +346,8 @@ pub fn get_blocks<D: BlockDevice>(
     )?;
     allocated_count = actual_allocated;
 
-    // 记录块分配结果
-    info!(
+    // 🚀 性能优化：降低日志级别
+    debug!(
         "[EXTENT WRITE] Allocated blocks: logical={}, physical={:#x}, count={}, goal={:#x}",
         logical_block, physical_block, actual_allocated, goal
     );
@@ -375,7 +375,8 @@ pub fn get_blocks<D: BlockDevice>(
             // 注意：blocks_count 以 512 字节扇区为单位
             inode_ref.add_blocks(allocated_count)?;
 
-            info!(
+            // 🚀 性能优化：降低日志级别
+            debug!(
                 "[EXTENT WRITE] Successfully inserted extent: logical={}, physical={:#x} (hi={:#x}, lo={:#x}), count={}",
                 logical_block, physical_block,
                 (physical_block >> 32) as u16, physical_block as u32,
